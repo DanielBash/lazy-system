@@ -139,6 +139,7 @@ async function renderDetail() {
       <button onclick="act('${name}','stop')">Stop</button>
       <button onclick="act('${name}','restart')">Restart</button>
       <button onclick="act('${name}','update')">Update now</button>
+      <button class="danger" onclick="del('${name}')">Delete</button>
     </div>
     <div class="card" style="margin-bottom:16px">
       <div><b>Uptime</b></div>
@@ -168,6 +169,16 @@ async function renderDetail() {
 async function act(name, action) {
   await api(`/api/${name}/${action}`, {method:'POST'});
   setTimeout(renderDetail, 500);
+}
+
+async function del(name) {
+  const typed = prompt(`Permanently delete "${name}"?\n\nThis stops the service, removes its systemd units, scripts, metrics, and history.\n\nType the app name to confirm:`);
+  if (typed !== name) return;
+  await api(`/api/${name}/delete`, {method:'POST'});
+  current = null;
+  document.getElementById('detail').className = 'empty';
+  document.getElementById('detail').innerHTML = `Deleted "${name}".`;
+  loadApps();
 }
 
 async function openSettings() {

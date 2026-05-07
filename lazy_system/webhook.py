@@ -177,6 +177,8 @@ class Handler(BaseHTTPRequestHandler):
                     apps.restart(name)
                 elif action == "update":
                     threading.Thread(target=apps.run_update, args=(name,), daemon=True).start()
+                elif action == "delete":
+                    apps.remove(name)
                 else:
                     return self._send_json(400, {"error": "unknown action"})
             except subprocess.CalledProcessError as e:
@@ -195,6 +197,8 @@ class Handler(BaseHTTPRequestHandler):
         if token != cfg.get("token"):
             return self._send_json(401, {"error": "bad token"})
         action = q.get("action", ["update"])[0]
+        if action == "delete":
+            return self._send_json(403, {"error": "delete not allowed via webhook"})
         history.record(name, "webhook", detail=action)
         if action == "update":
             threading.Thread(target=apps.run_update, args=(name,), daemon=True).start()

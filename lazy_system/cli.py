@@ -193,6 +193,7 @@ def main() -> None:
     s.add_argument("--description", "-d"); s.set_defaults(fn=cmd_create)
 
     s = sub.add_parser("remove", help="remove an app"); s.add_argument("name"); s.set_defaults(fn=cmd_remove)
+    s = sub.add_parser("delete", help="alias for remove"); s.add_argument("name"); s.set_defaults(fn=cmd_remove)
 
     s = sub.add_parser("edit", help="edit run|stop|update script")
     s.add_argument("name"); s.add_argument("kind", choices=["run", "stop", "update"])
