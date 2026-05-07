@@ -1,0 +1,191 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>lazy-system</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;
+         margin: 0; background:#0f1115; color:#e5e7eb; }
+  header { padding: 14px 22px; border-bottom: 1px solid #222a36;
+           display:flex; justify-content:space-between; align-items:center; }
+  header h1 { margin:0; font-size: 18px; font-weight: 600; letter-spacing:0.3px; }
+  main { display:grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 50px); }
+  aside { border-right:1px solid #222a36; padding: 10px; overflow-y:auto; }
+  .app { padding: 10px 12px; border-radius: 8px; cursor: pointer;
+         display:flex; justify-content:space-between; align-items:center; }
+  .app:hover { background:#1a2030; }
+  .app.active { background:#1f2a44; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#374151; }
+  .dot.up { background:#10b981; }
+  section { padding: 18px 24px; overflow:auto; }
+  .row { display:flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  button { background:#1f2937; color:#e5e7eb; border:1px solid #374151;
+           padding: 6px 12px; border-radius: 6px; cursor:pointer; }
+  button:hover { background:#2b3648; }
+  button.danger { border-color:#7f1d1d; }
+  .card { background:#151a24; border:1px solid #222a36; border-radius:10px;
+          padding: 14px 16px; }
+  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .uptime { display:flex; gap:1px; height:18px; background:#0b0e14;
+            border-radius:4px; overflow:hidden; }
+  .uptime span { flex:1; }
+  .uptime .ok  { background:#10b981; }
+  .uptime .bad { background:#ef4444; }
+  .uptime .gap { background:#374151; }
+  pre { background:#0b0e14; border:1px solid #222a36; padding:10px;
+        max-height: 320px; overflow:auto; font: 12px/1.4 ui-monospace,Menlo,monospace; }
+  table { width:100%; border-collapse: collapse; }
+  td { padding: 4px 8px; border-bottom: 1px solid #222a36; vertical-align: top; }
+  small { color:#9ca3af; }
+  input, select { background:#0b0e14; color:#e5e7eb; border:1px solid #374151;
+                  padding:6px 8px; border-radius:6px; }
+  .pill { background:#1f2937; padding:2px 8px; border-radius:999px; font-size:12px;
+          margin-right: 4px; }
+  .empty { color:#6b7280; padding: 20px; }
+</style></head><body>
+<header>
+  <h1>lazy-system</h1>
+  <div>
+    <small id="auth-state" style="color:#9ca3af;margin-right:10px"></small>
+    <button onclick="openSettings()">Settings</button>
+  </div>
+</header>
+<main>
+  <aside id="apps"></aside>
+  <section id="detail" class="empty">Select an app on the left.</section>
+</main>
+
+<script>
+let current = null;
+let charts = {};
+
+async function api(path, opts={}) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(await r.text());
+  const ct = r.headers.get('content-type')||'';
+  return ct.includes('json') ? r.json() : r.text();
+}
+
+async function loadApps() {
+  const apps = await api('/api/apps');
+  const aside = document.getElementById('apps');
+  aside.innerHTML = '';
+  if (!apps.length) {
+    aside.innerHTML = '<div class="empty">No apps yet.<br><small>lazy create &lt;name&gt;</small></div>';
+    return;
+  }
+  for (const a of apps) {
+    const el = document.createElement('div');
+    el.className = 'app' + (current === a.name ? ' active' : '');
+    el.innerHTML = `<span>${a.name}</span><span class="dot ${a.active?'up':''}"></span>`;
+    el.onclick = () => selectApp(a.name);
+    aside.appendChild(el);
+  }
+}
+
+async function selectApp(name) {
+  current = name;
+  await loadApps();
+  await renderDetail();
+}
+
+function fmtBytes(b) {
+  if (b < 1024) return b+' B';
+  if (b < 1024*1024) return (b/1024).toFixed(1)+' KB';
+  if (b < 1024*1024*1024) return (b/1024/1024).toFixed(1)+' MB';
+  return (b/1024/1024/1024).toFixed(2)+' GB';
+}
+
+function renderUptime(metrics, history) {
+  // bucket the last N samples into a bar
+  const buckets = metrics.slice(-120);
+  const evs = history.reduce((m,h)=> (m[h.event]=(m[h.event]||0)+1, m), {});
+  const html = buckets.map(s => `<span class="${s.active?'ok':'bad'}" title="${new Date(s.t*1000).toLocaleString()}"></span>`).join('');
+  return `<div class="uptime">${html||'<span class="gap"></span>'}</div>
+          <small>restarts: ${evs.restart||0} · failures: ${evs.exit||0} · updates: ${evs.update_ok||0} (${evs.update_failed||0} failed)</small>`;
+}
+
+function buildChart(canvas, label, data, color, fmt) {
+  if (charts[canvas.id]) charts[canvas.id].destroy();
+  charts[canvas.id] = new Chart(canvas, {
+    type: 'line',
+    data: { labels: data.map(p=>new Date(p.t*1000).toLocaleTimeString()),
+            datasets: [{ label, data: data.map(fmt), borderColor: color,
+                         backgroundColor: color+'30', tension:0.25, pointRadius:0, fill:true }] },
+    options: { animation:false, plugins:{legend:{display:false}},
+               scales:{x:{ticks:{maxTicksLimit:6,color:'#9ca3af'},grid:{color:'#1f2937'}},
+                       y:{beginAtZero:true,ticks:{color:'#9ca3af'},grid:{color:'#1f2937'}}}}
+  });
+}
+
+async function renderDetail() {
+  const name = current;
+  if (!name) return;
+  const [appsList, metrics, history, logs] = await Promise.all([
+    api('/api/apps'),
+    api(`/api/${name}/metrics`),
+    api(`/api/${name}/history`),
+    api(`/api/${name}/logs?n=200`),
+  ]);
+  const a = appsList.find(x=>x.name===name);
+  const sched = (a.schedules||[]).map(s=>`<span class="pill">${s.spec}</span>`).join('') || '<small>none</small>';
+  const hookUrl = a.webhook_enabled ? `${location.origin}${a.webhook_path}?action=update` : '<small>disabled</small>';
+
+  document.getElementById('detail').className = '';
+  document.getElementById('detail').innerHTML = `
+    <h2 style="margin:0 0 4px">${name} <small style="color:${a.active?'#10b981':'#9ca3af'}">${a.active?'running':'stopped'}</small></h2>
+    <small>${a.description||''} · shell: ${a.shell}</small>
+    <div class="row" style="margin-top:12px">
+      <button onclick="act('${name}','start')">Start</button>
+      <button onclick="act('${name}','stop')">Stop</button>
+      <button onclick="act('${name}','restart')">Restart</button>
+      <button onclick="act('${name}','update')">Update now</button>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <div><b>Uptime</b></div>
+      ${renderUptime(metrics, history)}
+    </div>
+    <div class="grid2">
+      <div class="card"><b>CPU %</b><canvas id="cpu" height="120"></canvas></div>
+      <div class="card"><b>RAM</b><canvas id="ram" height="120"></canvas></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div><b>Schedules</b> ${sched}</div>
+      <div style="margin-top:8px"><b>Webhook</b> <code>${hookUrl}</code></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div><b>Logs</b> <small>(last 200 lines)</small></div>
+      <pre>${logs.replace(/[<&]/g, c=>({'<':'&lt;','&':'&amp;'}[c]))}</pre>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <b>History</b>
+      <table>${history.slice().reverse().slice(0,40).map(h=>`<tr><td><small>${new Date(h.t*1000).toLocaleString()}</small></td><td>${h.event}</td><td><small>${h.detail||''}</small></td></tr>`).join('')}</table>
+    </div>
+  `;
+  buildChart(document.getElementById('cpu'), 'cpu%', metrics, '#60a5fa', p=>p.cpu);
+  buildChart(document.getElementById('ram'), 'rss',  metrics, '#f59e0b', p=>p.rss/1024/1024);
+}
+
+async function act(name, action) {
+  await api(`/api/${name}/${action}`, {method:'POST'});
+  setTimeout(renderDetail, 500);
+}
+
+async function openSettings() {
+  const cfg = await api('/api/config');
+  alert('Most settings live in the TUI: sudo lazysystem → "g" settings.\n\n'
+      + `Web port: ${cfg.webhook_port}\nBind: ${cfg.web_bind}\nUser: ${cfg.web_user}\n`
+      + `Save logs: ${cfg.save_logs}\nMetrics interval: ${cfg.metrics_interval_seconds}s`);
+}
+
+async function refreshAuthState() {
+  try {
+    const cfg = await api('/api/config');
+    document.getElementById('auth-state').textContent =
+      cfg.web_password ? `signed in as ${cfg.web_user}` : 'no password set (loopback only)';
+  } catch (e) {}
+}
+
+loadApps(); refreshAuthState();
+setInterval(()=>{ loadApps(); if (current) renderDetail(); }, 5000);
+</script>
+</body></html>
