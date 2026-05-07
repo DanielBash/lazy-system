@@ -78,6 +78,7 @@ def create(name: str, shell: str | None = None, description: str = "") -> dict:
         "webhook_enabled": True,
         "env": {},
         "working_dir": "",
+        "limits": {},
         "created": _now(),
     }
     save(name, cfg)
@@ -134,6 +135,13 @@ def _write_units(name: str, cfg: dict) -> None:
     env_lines = "\n".join(f"Environment={k}={_escape_env(v)}" for k, v in cfg.get("env", {}).items())
     wd = cfg.get("working_dir", "") or ""
     wd_line = f"WorkingDirectory={wd}\n" if wd else ""
+    limits = cfg.get("limits", {}) or {}
+    limit_lines = "\n".join(filter(None, [
+        f"CPUQuota={limits['cpu_quota']}" if limits.get("cpu_quota") else "",
+        f"MemoryMax={limits['memory_max']}" if limits.get("memory_max") else "",
+        f"TasksMax={limits['tasks_max']}" if limits.get("tasks_max") else "",
+        f"IOWeight={limits['io_weight']}" if limits.get("io_weight") else "",
+    ]))
     svc.write_text(f"""[Unit]
 Description=lazy-system app {name}
 After=network-online.target
@@ -141,6 +149,7 @@ After=network-online.target
 [Service]
 Type=simple
 {wd_line}{env_lines}
+{limit_lines}
 ExecStart={_runner_cmd(name, 'run')}
 ExecStop={_runner_cmd(name, 'stop')}
 Restart=on-failure
@@ -305,6 +314,28 @@ def set_env(name: str, key: str, value: str | None) -> None:
     if is_active(name):
         restart(name)
     history.record(name, "env_changed", detail=key)
+
+
+VALID_LIMITS = ("cpu_quota", "memory_max", "tasks_max", "io_weight")
+
+
+def set_limits(name: str, **kwargs) -> dict:
+    """Set or clear per-app systemd resource limits. Pass value=None to clear."""
+    cfg = load(name)
+    limits = cfg.setdefault("limits", {})
+    for k, v in kwargs.items():
+        if k not in VALID_LIMITS:
+            raise ValueError(f"unknown limit: {k}")
+        if v is None or v == "":
+            limits.pop(k, None)
+        else:
+            limits[k] = str(v)
+    save(name, cfg)
+    _write_units(name, cfg)
+    if is_active(name):
+        restart(name)
+    history.record(name, "limits_changed")
+    return limits
 
 
 def export_app(name: str, target_dir: str) -> str:

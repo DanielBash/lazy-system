@@ -24,30 +24,30 @@ that come up on boot:
 - `lazy-webhook.service` — web UI + webhook receiver
 - `lazy-monitor.service` — CPU/RAM sampler
 
-After install:
+The installer prompts for a web UI password during install. Skip the prompt
+and you can set it later with `sudo lazysystem passwd`.
 
 ```bash
-sudo lazysystem passwd      # set a web password (required for non-loopback)
 sudo lazysystem              # launch the TUI
 ```
 
 ## TUI
 
-`sudo lazysystem` opens a curses dashboard:
+`sudo lazysystem` opens a [Textual](https://textual.textualize.io/) UI with
+mouse + keyboard support:
 
-- live CPU% and RAM sparklines
-- uptime bar with restart / failure / update history
-- per-app: start, stop, restart, update, edit (run/stop/update), env vars,
-  schedules, webhook URL, logs
-- global settings: web port, bind address, username/password, default shell,
-  log saving, metrics interval, export/import apps, doctor (auto-fix unit files)
+- click apps in the sidebar; click action buttons; click tabs (Overview /
+  History / Logs)
+- live CPU% and RAM sparklines (Textual `Sparkline`)
+- color uptime bar (green = up, red = down) from sample history
+- modals with form widgets for create / env / schedules / limits / settings
 
 Keys (also shown on the bottom bar):
 
 ```
-↑/↓ select  enter status   s start  x stop  r restart  u update
-e edit      E env vars     l logs   t schedule  w webhook
-n new       D delete       / filter g settings ? help  q quit
+n new   s start   x stop   r restart   u update
+e edit  E env     L limits t schedule  w webhook
+l logs  delete    / filter g settings  ? help    q quit
 ```
 
 ## CLI
@@ -64,6 +64,9 @@ sudo lazysystem update myapp                    # stop → update → start
 sudo lazysystem schedule add myapp every-weekend
 sudo lazysystem schedule add myapp 'Mon..Fri 09:00'
 sudo lazysystem env set myapp API_KEY=xxx
+sudo lazysystem limits set myapp --cpu 50% --mem 512M --tasks 100
+sudo lazysystem limits show myapp
+sudo lazysystem limits clear myapp --cpu
 sudo lazysystem webhook myapp
 sudo lazysystem logs   myapp -f
 sudo lazysystem status myapp

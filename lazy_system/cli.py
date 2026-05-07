@@ -118,6 +118,38 @@ def cmd_env(args) -> None:
         apps.set_env(args.name, args.key, None)
 
 
+def cmd_limits(args) -> None:
+    if args.action == "show":
+        lim = apps.load(args.name).get("limits", {}) or {}
+        if not lim:
+            print("(no limits set)")
+            return
+        for k, v in lim.items():
+            print(f"{k}={v}")
+        return
+    _need_root()
+    if args.action == "set":
+        kw = {
+            "cpu_quota":  args.cpu,
+            "memory_max": args.mem,
+            "tasks_max":  args.tasks,
+            "io_weight":  args.io,
+        }
+        kw = {k: v for k, v in kw.items() if v is not None}
+        if not kw:
+            sys.exit("nothing to set; pass at least one of --cpu/--mem/--tasks/--io")
+        apps.set_limits(args.name, **kw)
+        print(f"limits updated for {args.name}")
+    elif args.action == "clear":
+        flag_to_key = {"cpu": "cpu_quota", "mem": "memory_max",
+                       "tasks": "tasks_max", "io": "io_weight"}
+        cleared = {key: None for flag, key in flag_to_key.items() if getattr(args, flag, False)}
+        if not cleared:
+            cleared = {k: None for k in flag_to_key.values()}
+        apps.set_limits(args.name, **cleared)
+        print(f"limits cleared for {args.name}")
+
+
 def cmd_export(args) -> None:
     p = apps.export_app(args.name, args.dir or ".")
     print(p)
@@ -224,6 +256,21 @@ def main() -> None:
     a = ss.add_parser("set");   a.add_argument("name"); a.add_argument("kv", help="KEY=VALUE")
     a = ss.add_parser("unset"); a.add_argument("name"); a.add_argument("key")
     s.set_defaults(fn=cmd_env)
+
+    s = sub.add_parser("limits", help="systemd resource limits per app")
+    ss = s.add_subparsers(dest="action", required=True)
+    a = ss.add_parser("show"); a.add_argument("name")
+    a = ss.add_parser("set");  a.add_argument("name")
+    a.add_argument("--cpu",   help="CPUQuota e.g. 50%% or 200%%")
+    a.add_argument("--mem",   help="MemoryMax e.g. 512M, 2G")
+    a.add_argument("--tasks", help="TasksMax integer")
+    a.add_argument("--io",    help="IOWeight 10–1000")
+    a = ss.add_parser("clear"); a.add_argument("name")
+    a.add_argument("--cpu",   action="store_true")
+    a.add_argument("--mem",   action="store_true")
+    a.add_argument("--tasks", action="store_true")
+    a.add_argument("--io",    action="store_true")
+    s.set_defaults(fn=cmd_limits)
 
     s = sub.add_parser("export"); s.add_argument("name"); s.add_argument("--dir"); s.set_defaults(fn=cmd_export)
     s = sub.add_parser("import"); s.add_argument("archive"); s.set_defaults(fn=cmd_import)

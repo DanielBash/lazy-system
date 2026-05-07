@@ -1,45 +1,29 @@
-"""Curses TUI for lazy-system."""
-import curses
-import json
+"""Textual TUI for lazy-system."""
 import os
 import subprocess
 import time
+
+from textual import on
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll, Grid
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Header, Footer, ListView, ListItem, Label, Static, Sparkline,
+    Input, Button, DataTable, TabbedContent, TabPane, RichLog, Switch,
+)
+
 from . import apps, auth, config, history, schedule
-from .paths import metrics_path
+from .paths import metrics_path, log_path
 
-SPARK = " ▁▂▃▄▅▆▇█"
-TICK = 1.0  # refresh seconds
-
-KEYMAP = [
-    ("↑/↓", "select"),
-    ("enter", "details"),
-    ("s", "start"),
-    ("x", "stop"),
-    ("r", "restart"),
-    ("u", "update"),
-    ("e", "edit"),
-    ("E", "env"),
-    ("l", "logs"),
-    ("t", "schedule"),
-    ("w", "webhook"),
-    ("n", "new"),
-    ("D", "delete"),
-    ("/", "filter"),
-    ("g", "settings"),
-    ("?", "help"),
-    ("q", "quit"),
-]
+POLL_DETAIL_S = 1.0
+POLL_LIST_S = 3.0
 
 
-# ------------------------- helpers -------------------------
+# ============================ helpers ============================
 
-def _need_root_or_die() -> None:
-    if os.geteuid() != 0:
-        print("lazy-system: TUI must run as root (sudo lazysystem)")
-        raise SystemExit(1)
-
-
-def _read_metrics(name: str, n: int = 200) -> list[dict]:
+def _read_metrics(name: str, n: int = 240) -> list[dict]:
+    import json
     p = metrics_path(name)
     if not p.exists():
         return []
@@ -52,21 +36,7 @@ def _read_metrics(name: str, n: int = 200) -> list[dict]:
     return out
 
 
-def _spark(values: list[float], width: int) -> str:
-    if not values or width <= 0:
-        return " " * width
-    vs = values[-width:]
-    if len(vs) < width:
-        vs = [0.0] * (width - len(vs)) + vs
-    hi = max(vs) or 1.0
-    out = []
-    for v in vs:
-        idx = int(v / hi * (len(SPARK) - 1))
-        out.append(SPARK[max(0, min(len(SPARK) - 1, idx))])
-    return "".join(out)
-
-
-def _fmt_bytes(b: int) -> str:
+def _fmt_bytes(b: float) -> str:
     f = float(b)
     for unit in ("B", "K", "M", "G"):
         if f < 1024:
@@ -75,502 +45,855 @@ def _fmt_bytes(b: int) -> str:
     return f"{f:.1f}T"
 
 
-def _safe_addstr(win, y, x, s, attr=0):
-    try:
-        h, w = win.getmaxyx()
-        if y < 0 or y >= h or x >= w:
+def _read_log_tail(name: str, lines: int = 400) -> str:
+    """Prefer the per-app log file (clean stdout). Fall back to journalctl -o cat."""
+    p = log_path(name)
+    if p.exists():
+        try:
+            data = p.read_bytes()
+            tail = data[-300_000:].decode("utf-8", errors="replace")
+            return "\n".join(tail.splitlines()[-lines:])
+        except Exception:
+            pass
+    r = subprocess.run(
+        ["journalctl", "-u", f"lazy-{name}.service",
+         "-n", str(lines), "--no-pager", "-o", "cat"],
+        capture_output=True, text=True,
+    )
+    return r.stdout or "(no logs yet)"
+
+
+def _need_root_or_die() -> None:
+    if os.geteuid() != 0:
+        print("lazy-system: TUI must run as root (sudo lazysystem)")
+        raise SystemExit(1)
+
+
+# ============================ modal screens ============================
+
+class ConfirmScreen(ModalScreen[bool]):
+    DEFAULT_CSS = """
+    ConfirmScreen { align: center middle; }
+    ConfirmScreen > Vertical {
+        background: $surface; border: thick $primary; padding: 1 2;
+        width: 60; height: auto;
+    }
+    ConfirmScreen Horizontal { align: center middle; height: 3; }
+    ConfirmScreen Button { margin: 0 1; }
+    """
+
+    def __init__(self, prompt: str, danger: bool = False):
+        super().__init__()
+        self.prompt = prompt
+        self.danger = danger
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(self.prompt)
+            with Horizontal():
+                yield Button("Cancel", id="no")
+                yield Button("Confirm", id="yes", variant="error" if self.danger else "primary")
+
+    def on_button_pressed(self, ev: Button.Pressed) -> None:
+        self.dismiss(ev.button.id == "yes")
+
+    def on_key(self, ev) -> None:
+        if ev.key == "escape": self.dismiss(False)
+        elif ev.key == "enter": self.dismiss(True)
+
+
+class PromptScreen(ModalScreen[str | None]):
+    DEFAULT_CSS = """
+    PromptScreen { align: center middle; }
+    PromptScreen > Vertical {
+        background: $surface; border: thick $primary; padding: 1 2;
+        width: 70; height: auto;
+    }
+    PromptScreen Input { margin-top: 1; }
+    PromptScreen Horizontal { align: right middle; height: 3; margin-top: 1; }
+    """
+
+    def __init__(self, label: str, default: str = "", password: bool = False, placeholder: str = ""):
+        super().__init__()
+        self.label = label
+        self.default = default
+        self.password = password
+        self.placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self.label)
+            yield Input(value=self.default, password=self.password,
+                        placeholder=self.placeholder, id="inp")
+            with Horizontal():
+                yield Button("Cancel", id="cancel")
+                yield Button("OK", id="ok", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#inp", Input).focus()
+
+    @on(Input.Submitted)
+    def _on_submit(self, ev: Input.Submitted) -> None:
+        self.dismiss(ev.value)
+
+    def on_button_pressed(self, ev: Button.Pressed) -> None:
+        self.dismiss(self.query_one("#inp", Input).value if ev.button.id == "ok" else None)
+
+    def on_key(self, ev) -> None:
+        if ev.key == "escape": self.dismiss(None)
+
+
+class ChoiceScreen(ModalScreen[str | None]):
+    DEFAULT_CSS = """
+    ChoiceScreen { align: center middle; }
+    ChoiceScreen > Vertical {
+        background: $surface; border: thick $primary; padding: 1 2;
+        width: 60; height: auto; max-height: 24;
+    }
+    ChoiceScreen ListView { height: auto; max-height: 16; margin-top: 1; }
+    """
+
+    def __init__(self, title: str, options: list[tuple[str, str]]):
+        """options is [(value, label)]"""
+        super().__init__()
+        self.title_text = title
+        self.options = options
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self.title_text)
+            yield ListView(*[ListItem(Label(lbl), id=f"opt-{i}")
+                             for i, (_, lbl) in enumerate(self.options)], id="lv")
+
+    def on_mount(self) -> None:
+        self.query_one(ListView).focus()
+
+    @on(ListView.Selected)
+    def _picked(self, ev: ListView.Selected) -> None:
+        idx = int(ev.item.id.split("-")[1])
+        self.dismiss(self.options[idx][0])
+
+    def on_key(self, ev) -> None:
+        if ev.key == "escape": self.dismiss(None)
+
+
+class InfoScreen(ModalScreen):
+    DEFAULT_CSS = """
+    InfoScreen { align: center middle; }
+    InfoScreen > Vertical {
+        background: $surface; border: thick $primary; padding: 1 2;
+        width: 90%; height: 80%;
+    }
+    InfoScreen RichLog { height: 1fr; border: round $accent; }
+    InfoScreen Horizontal { align: right middle; height: 3; margin-top: 1; }
+    """
+
+    def __init__(self, title: str, body: str):
+        super().__init__()
+        self.title_text = title
+        self.body = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self.title_text)
+            log = RichLog(wrap=True, highlight=True)
+            yield log
+            with Horizontal():
+                yield Button("Close", id="close", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one(RichLog).write(self.body)
+
+    def on_button_pressed(self, _) -> None: self.dismiss(None)
+    def on_key(self, ev) -> None:
+        if ev.key in ("escape", "q", "enter"): self.dismiss(None)
+
+
+class NewAppScreen(ModalScreen[dict | None]):
+    DEFAULT_CSS = """
+    NewAppScreen { align: center middle; }
+    NewAppScreen > Vertical {
+        background: $surface; border: thick $primary; padding: 1 2;
+        width: 70; height: auto;
+    }
+    NewAppScreen Input, NewAppScreen Label { margin-top: 1; }
+    NewAppScreen Horizontal { align: right middle; height: 3; margin-top: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Create new app")
+            yield Label("name (lowercase, [a-z0-9_-])")
+            yield Input(id="name", placeholder="my-app")
+            yield Label("description (optional)")
+            yield Input(id="desc")
+            yield Label("shell")
+            yield Input(value="auto", id="shell", placeholder="auto, bash, or fish")
+            with Horizontal():
+                yield Button("Cancel", id="cancel")
+                yield Button("Create", id="ok", variant="primary")
+
+    def on_mount(self) -> None: self.query_one("#name", Input).focus()
+
+    def on_button_pressed(self, ev: Button.Pressed) -> None:
+        if ev.button.id != "ok":
+            self.dismiss(None); return
+        self.dismiss({
+            "name": self.query_one("#name", Input).value.strip(),
+            "description": self.query_one("#desc", Input).value.strip(),
+            "shell": (self.query_one("#shell", Input).value.strip() or "auto"),
+        })
+
+    def on_key(self, ev) -> None:
+        if ev.key == "escape": self.dismiss(None)
+
+
+class LimitsScreen(ModalScreen[dict | None]):
+    DEFAULT_CSS = """
+    LimitsScreen { align: center middle; }
+    LimitsScreen > Vertical {
+        background: $surface; border: thick $primary; padding: 1 2;
+        width: 72; height: auto;
+    }
+    LimitsScreen Input, LimitsScreen Label { margin-top: 1; }
+    LimitsScreen Horizontal#btns { align: right middle; height: 3; margin-top: 1; }
+    LimitsScreen .hint { color: $text-muted; }
+    """
+
+    def __init__(self, current: dict):
+        super().__init__()
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Resource limits (leave blank to clear)")
+            yield Label("CPU quota (e.g. 50% or 200%)", classes="hint")
+            yield Input(value=self.current.get("cpu_quota", ""), id="cpu", placeholder="50%")
+            yield Label("Memory max (e.g. 512M, 2G)", classes="hint")
+            yield Input(value=self.current.get("memory_max", ""), id="mem", placeholder="512M")
+            yield Label("Tasks max (process+thread cap)", classes="hint")
+            yield Input(value=self.current.get("tasks_max", ""), id="tasks", placeholder="100")
+            yield Label("IO weight (10–1000)", classes="hint")
+            yield Input(value=self.current.get("io_weight", ""), id="io", placeholder="100")
+            with Horizontal(id="btns"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Save", id="ok", variant="primary")
+
+    def on_button_pressed(self, ev: Button.Pressed) -> None:
+        if ev.button.id != "ok":
+            self.dismiss(None); return
+        self.dismiss({
+            "cpu_quota":  self.query_one("#cpu", Input).value.strip() or None,
+            "memory_max": self.query_one("#mem", Input).value.strip() or None,
+            "tasks_max":  self.query_one("#tasks", Input).value.strip() or None,
+            "io_weight":  self.query_one("#io", Input).value.strip() or None,
+        })
+
+    def on_key(self, ev) -> None:
+        if ev.key == "escape": self.dismiss(None)
+
+
+class SettingsScreen(ModalScreen[bool]):
+    DEFAULT_CSS = """
+    SettingsScreen { align: center middle; }
+    SettingsScreen > Vertical {
+        background: $surface; border: thick $primary; padding: 1 2;
+        width: 80; height: auto;
+    }
+    SettingsScreen Input, SettingsScreen Label { margin-top: 1; }
+    SettingsScreen Horizontal { align: right middle; height: 3; margin-top: 1; }
+    SettingsScreen .row { height: 3; align: left middle; }
+    SettingsScreen .row Label { width: 30; }
+    """
+
+    def compose(self) -> ComposeResult:
+        cfg = config.load()
+        with Vertical():
+            yield Label("Global settings")
+            yield Label("web port")
+            yield Input(value=str(cfg["webhook_port"]), id="port")
+            yield Label("bind address (0.0.0.0 or 127.0.0.1)")
+            yield Input(value=cfg["web_bind"], id="bind")
+            yield Label("web username")
+            yield Input(value=cfg["web_user"], id="user")
+            yield Label("default shell (auto / bash / fish)")
+            yield Input(value=cfg["shell"], id="shell")
+            yield Label("metrics interval (seconds)")
+            yield Input(value=str(cfg["metrics_interval_seconds"]), id="interval")
+            with Horizontal(classes="row"):
+                yield Label("save logs to file")
+                yield Switch(value=bool(cfg["save_logs"]), id="logs")
+            with Horizontal():
+                yield Button("Set password…", id="pw")
+                yield Button("Cancel", id="cancel")
+                yield Button("Save", id="ok", variant="primary")
+
+    def on_button_pressed(self, ev: Button.Pressed) -> None:
+        if ev.button.id == "pw":
+            self.app.push_screen(PromptScreen("new web password", password=True),
+                                 self._got_pw)
             return
-        win.addnstr(y, x, s, max(0, w - x - 1), attr)
-    except curses.error:
-        pass
+        if ev.button.id != "ok":
+            self.dismiss(False); return
+        cfg = config.load()
+        port = self.query_one("#port", Input).value.strip()
+        if port.isdigit(): cfg["webhook_port"] = int(port)
+        cfg["web_bind"] = self.query_one("#bind", Input).value.strip() or cfg["web_bind"]
+        cfg["web_user"] = self.query_one("#user", Input).value.strip() or cfg["web_user"]
+        cfg["shell"] = self.query_one("#shell", Input).value.strip() or cfg["shell"]
+        iv = self.query_one("#interval", Input).value.strip()
+        if iv.isdigit(): cfg["metrics_interval_seconds"] = max(1, int(iv))
+        cfg["save_logs"] = self.query_one("#logs", Switch).value
+        config.save(cfg)
+        apps.regenerate_all_units()
+        subprocess.run(["systemctl", "restart", "lazy-webhook.service"], check=False)
+        self.dismiss(True)
+
+    def _got_pw(self, pw: str | None) -> None:
+        if not pw: return
+        def confirmed(pw2: str | None) -> None:
+            if pw2 != pw:
+                self.app.push_screen(InfoScreen("error", "passwords do not match"))
+                return
+            cfg = config.load()
+            cfg["web_password"] = auth.hash_password(pw)
+            config.save(cfg)
+            subprocess.run(["systemctl", "restart", "lazy-webhook.service"], check=False)
+            self.app.push_screen(InfoScreen("ok", "web password set"))
+        self.app.push_screen(PromptScreen("confirm password", password=True), confirmed)
+
+    def on_key(self, ev) -> None:
+        if ev.key == "escape": self.dismiss(False)
 
 
-# ------------------------- modal helpers -------------------------
+# ============================ widgets ============================
 
-def _prompt(stdscr, label: str, default: str = "", secret: bool = False) -> str | None:
-    """Single-line prompt at the bottom. Returns None on Esc."""
-    h, w = stdscr.getmaxyx()
-    win = curses.newwin(3, max(40, w - 6), h // 2 - 1, 3)
-    win.box()
-    _safe_addstr(win, 0, 2, f" {label} ", curses.A_BOLD)
-    curses.curs_set(1)
-    curses.echo(not secret)
-    buf = list(default)
-    while True:
-        win.move(1, 2)
-        win.clrtoeol()
-        win.box()
-        _safe_addstr(win, 0, 2, f" {label} ", curses.A_BOLD)
-        shown = ("*" * len(buf)) if secret else "".join(buf)
-        _safe_addstr(win, 1, 2, shown[-(win.getmaxyx()[1] - 4):])
-        win.refresh()
-        c = win.get_wch()
-        if c in ("\n", "\r"):
-            break
-        if c == "\x1b":
-            curses.noecho(); curses.curs_set(0)
-            return None
-        if c in ("\x7f", curses.KEY_BACKSPACE, "\b"):
-            if buf:
-                buf.pop()
-            continue
-        if isinstance(c, str) and c.isprintable():
-            buf.append(c)
-    curses.noecho(); curses.curs_set(0)
-    return "".join(buf)
+class AppRow(ListItem):
+    def __init__(self, name: str, running: bool):
+        super().__init__()
+        self.name_ = name
+        self.running = running
+
+    def compose(self) -> ComposeResult:
+        dot = "[green]●[/]" if self.running else "[dim]○[/]"
+        yield Static(f" {dot} {self.name_}")
 
 
-def _menu(stdscr, title: str, options: list[str]) -> int | None:
-    h, w = stdscr.getmaxyx()
-    width = max(len(title) + 4, max((len(o) for o in options), default=10) + 6)
-    height = len(options) + 4
-    win = curses.newwin(height, width, max(1, h // 2 - height // 2),
-                        max(1, w // 2 - width // 2))
-    sel = 0
-    while True:
-        win.erase(); win.box()
-        _safe_addstr(win, 0, 2, f" {title} ", curses.A_BOLD)
-        for i, o in enumerate(options):
-            attr = curses.A_REVERSE if i == sel else 0
-            _safe_addstr(win, 2 + i, 2, f" {o} ".ljust(width - 4), attr)
-        win.refresh()
-        c = win.getch()
-        if c in (curses.KEY_UP, ord("k")): sel = (sel - 1) % len(options)
-        elif c in (curses.KEY_DOWN, ord("j")): sel = (sel + 1) % len(options)
-        elif c in (10, 13, curses.KEY_ENTER): return sel
-        elif c in (27, ord("q")): return None
+class Detail(VerticalScroll):
+    DEFAULT_CSS = """
+    Detail { padding: 1 2; }
+    Detail .title { text-style: bold; }
+    Detail .muted { color: $text-muted; }
+    Detail .ok { color: $success; }
+    Detail .bad { color: $error; }
+    Detail Sparkline { height: 3; margin: 0 0 1 0; }
+    Detail .buttons { height: 3; margin-top: 1; }
+    Detail .buttons Button { margin-right: 1; }
+    Detail TabbedContent { margin-top: 1; }
+    Detail #cpu { color: $accent; }
+    Detail #ram { color: $warning; }
+    Detail RichLog { height: 14; border: round $accent; }
+    Detail DataTable { height: auto; max-height: 12; }
+    Detail .hbar {
+        height: 1; background: $boost;
+    }
+    """
 
+    def __init__(self):
+        super().__init__()
+        self.app_name: str | None = None
+        self._log_offset: int = 0
+        self._title_static: Static | None = None
+        self._cpu_spark: Sparkline | None = None
+        self._ram_spark: Sparkline | None = None
+        self._summary: Static | None = None
+        self._sched: Static | None = None
+        self._webhook: Static | None = None
+        self._env: Static | None = None
+        self._limits: Static | None = None
+        self._uptime: Static | None = None
+        self._log: RichLog | None = None
+        self._history_table: DataTable | None = None
 
-def _confirm(stdscr, msg: str) -> bool:
-    return _menu(stdscr, msg, ["No", "Yes"]) == 1
+    def compose(self) -> ComposeResult:
+        self._title_static = Static("select an app", classes="title")
+        yield self._title_static
+        with Horizontal(classes="buttons"):
+            yield Button("Start",   id="b-start",   variant="success")
+            yield Button("Stop",    id="b-stop")
+            yield Button("Restart", id="b-restart")
+            yield Button("Update",  id="b-update",  variant="primary")
+            yield Button("Logs ↗",  id="b-logs-full")
+            yield Button("Delete",  id="b-delete",  variant="error")
+        with Horizontal(classes="buttons"):
+            yield Button("Edit script…", id="b-edit")
+            yield Button("Env vars…",    id="b-env")
+            yield Button("Limits…",      id="b-limits")
+            yield Button("Schedules…",   id="b-schedule")
+            yield Button("Webhook…",     id="b-webhook")
+        yield Static("CPU %", classes="muted")
+        self._cpu_spark = Sparkline([0], id="cpu")
+        yield self._cpu_spark
+        yield Static("RAM (MB)", classes="muted")
+        self._ram_spark = Sparkline([0], id="ram")
+        yield self._ram_spark
 
+        self._uptime = Static("", classes="muted")
+        yield self._uptime
+        self._summary = Static("", classes="muted")
+        yield self._summary
 
-def _info(stdscr, title: str, text: str) -> None:
-    h, w = stdscr.getmaxyx()
-    lines = []
-    for line in text.splitlines():
-        while len(line) > w - 8:
-            lines.append(line[: w - 8]); line = line[w - 8:]
-        lines.append(line)
-    height = min(h - 4, len(lines) + 4)
-    width = min(w - 4, max(len(title) + 4, max((len(l) for l in lines), default=20) + 4))
-    win = curses.newwin(height, width, max(1, h // 2 - height // 2), max(1, w // 2 - width // 2))
-    off = 0
-    while True:
-        win.erase(); win.box()
-        _safe_addstr(win, 0, 2, f" {title} ", curses.A_BOLD)
-        view = lines[off: off + height - 4]
-        for i, ln in enumerate(view):
-            _safe_addstr(win, 1 + i, 2, ln)
-        _safe_addstr(win, height - 2, 2, "[↑/↓ scroll · q close]", curses.A_DIM)
-        win.refresh()
-        c = win.getch()
-        if c in (ord("q"), 27, 10, 13): return
-        if c == curses.KEY_UP and off > 0: off -= 1
-        if c == curses.KEY_DOWN and off + height - 4 < len(lines): off += 1
+        with TabbedContent():
+            with TabPane("Overview", id="t-overview"):
+                self._sched   = Static(""); yield self._sched
+                self._webhook = Static("", classes="muted"); yield self._webhook
+                self._env     = Static("", classes="muted"); yield self._env
+                self._limits  = Static("", classes="muted"); yield self._limits
+            with TabPane("History", id="t-history"):
+                t = DataTable()
+                t.add_columns("time", "event", "detail")
+                self._history_table = t
+                yield t
+            with TabPane("Logs", id="t-logs"):
+                self._log = RichLog(wrap=True, highlight=True, max_lines=500)
+                yield self._log
 
+    def set_app(self, name: str | None) -> None:
+        self.app_name = name
+        self._log_offset = 0
+        if self._log:
+            self._log.clear()
+        if not name:
+            self._title_static.update("select an app")
+        self.refresh_data(initial=True)
 
-def _shell_out(stdscr, cmd: list[str]) -> int:
-    """Suspend curses, run cmd interactively, resume."""
-    curses.def_prog_mode(); curses.endwin()
-    try:
-        rc = subprocess.run(cmd).returncode
-    finally:
-        stdscr.refresh(); curses.reset_prog_mode()
-    return rc
+    def refresh_data(self, initial: bool = False) -> None:
+        name = self.app_name
+        if not name or not apps.exists(name):
+            return
+        cfg = apps.load(name)
+        running = apps.is_active(name)
+        metrics = _read_metrics(name, 240)
+        hist = history.read(name, 80)
 
+        state_md = "[green]● running[/]" if running else "[dim]○ stopped[/]"
+        desc = cfg.get("description") or ""
+        self._title_static.update(
+            f"[b]{name}[/]  {state_md}\n[dim]{desc}  · shell: {cfg.get('shell')}[/]"
+        )
 
-# ------------------------- views -------------------------
+        cpu = [m.get("cpu", 0.0) for m in metrics] or [0.0]
+        rss_mb = [m.get("rss", 0) / 1_048_576 for m in metrics] or [0.0]
+        self._cpu_spark.data = cpu
+        self._ram_spark.data = rss_mb
+        cur_cpu = cpu[-1] if cpu else 0
+        cur_rss = metrics[-1].get("rss", 0) if metrics else 0
 
-def _draw_header(stdscr, total: int, running: int) -> None:
-    _, w = stdscr.getmaxyx()
-    cfg = config.load()
-    auth_label = "🔒 auth" if cfg.get("web_password") else "⚠ no-password (loopback only)"
-    title = f" lazy-system · {running}/{total} running · web :{cfg['webhook_port']} · {auth_label} "
-    _safe_addstr(stdscr, 0, 0, title.ljust(w), curses.A_REVERSE)
-
-
-def _draw_footer(stdscr) -> None:
-    h, w = stdscr.getmaxyx()
-    keys = "  ".join(f"{k}:{v}" for k, v in KEYMAP)
-    _safe_addstr(stdscr, h - 1, 0, keys[: w - 1].ljust(w - 1), curses.A_REVERSE)
-
-
-def _draw_sidebar(win, names: list[str], sel: int, filter_str: str, statuses: dict[str, bool]) -> None:
-    win.erase(); win.box()
-    _safe_addstr(win, 0, 2, f" apps ({len(names)}) ", curses.A_BOLD)
-    if filter_str:
-        _safe_addstr(win, 0, win.getmaxyx()[1] - len(filter_str) - 4, f" /{filter_str} ", curses.A_DIM)
-    if not names:
-        _safe_addstr(win, 2, 2, "no apps. press 'n' to create.", curses.A_DIM)
-        return
-    h, w = win.getmaxyx()
-    visible = h - 2
-    start = max(0, min(sel - visible // 2, len(names) - visible))
-    for i, name in enumerate(names[start: start + visible]):
-        idx = start + i
-        attr = curses.A_REVERSE if idx == sel else 0
-        running = statuses.get(name, False)
-        dot = "●" if running else "○"
-        line = f" {dot} {name} "
-        _safe_addstr(win, 1 + i, 1, line.ljust(w - 2), attr)
-
-
-def _draw_detail(win, name: str | None) -> None:
-    win.erase(); win.box()
-    if not name:
-        _safe_addstr(win, 0, 2, " detail ", curses.A_BOLD)
-        _safe_addstr(win, 2, 2, "select an app", curses.A_DIM)
-        return
-    cfg = apps.load(name)
-    running = apps.is_active(name)
-    metrics = _read_metrics(name, 600)
-    hist = history.read(name, 60)
-    h, w = win.getmaxyx()
-
-    state = "● running" if running else "○ stopped"
-    _safe_addstr(win, 0, 2, f" {name} · {state} ", curses.A_BOLD)
-    desc = cfg.get("description", "") or "(no description)"
-    _safe_addstr(win, 1, 2, desc[: w - 4], curses.A_DIM)
-    _safe_addstr(win, 2, 2, f"shell: {cfg.get('shell')}   created: {time.strftime('%Y-%m-%d', time.localtime(cfg.get('created', 0)))}")
-
-    # graphs
-    spark_w = min(64, w - 18)
-    cpu_vals = [m.get("cpu", 0.0) for m in metrics]
-    rss_vals = [m.get("rss", 0) / 1_048_576 for m in metrics]
-    cur_cpu = cpu_vals[-1] if cpu_vals else 0
-    cur_rss = (metrics[-1].get("rss", 0) if metrics else 0)
-    _safe_addstr(win, 4, 2, f"CPU {cur_cpu:5.1f}%  ")
-    _safe_addstr(win, 4, 16, _spark(cpu_vals, spark_w), curses.color_pair(2))
-    _safe_addstr(win, 5, 2, f"RAM {_fmt_bytes(cur_rss):>6}  ")
-    _safe_addstr(win, 5, 16, _spark(rss_vals, spark_w), curses.color_pair(3))
-
-    # uptime bar
-    bucket = metrics[-(w - 6):] if metrics else []
-    bar_y = 7
-    _safe_addstr(win, bar_y, 2, "uptime")
-    for i, m in enumerate(bucket):
-        ch = "▇"
-        attr = curses.color_pair(4 if m.get("active") else 5)
-        _safe_addstr(win, bar_y + 1, 2 + i, ch, attr)
-
-    # counters
-    counts: dict[str, int] = {}
-    for ev in hist:
-        counts[ev["event"]] = counts.get(ev["event"], 0) + 1
-    summary = (f"restarts: {counts.get('restart',0)}  "
-               f"failures: {counts.get('exit',0)}  "
-               f"updates: {counts.get('update_ok',0)} ok / {counts.get('update_failed',0)} fail  "
-               f"webhooks: {counts.get('webhook',0)}")
-    _safe_addstr(win, bar_y + 3, 2, summary, curses.A_DIM)
-
-    # schedules + webhook
-    g = config.load()
-    scheds = cfg.get("schedules", [])
-    sched_str = ", ".join(f"{s['spec']}" for s in scheds) or "(none)"
-    _safe_addstr(win, bar_y + 5, 2, f"schedules: {sched_str}"[: w - 4])
-    if cfg.get("webhook_enabled", True):
-        wh = f"http://localhost:{g['webhook_port']}/hook/{name}/{cfg['token']}?action=update"
-        _safe_addstr(win, bar_y + 6, 2, f"webhook: {wh}"[: w - 4], curses.A_DIM)
-
-    # env
-    env = cfg.get("env", {})
-    if env:
-        _safe_addstr(win, bar_y + 7, 2, f"env: " + " ".join(f"{k}=…" for k in env)[: w - 8], curses.A_DIM)
-
-    # recent events
-    _safe_addstr(win, bar_y + 9, 2, "recent events", curses.A_BOLD)
-    for i, ev in enumerate(reversed(hist[-min(8, h - bar_y - 11):])):
-        ts = time.strftime("%m-%d %H:%M:%S", time.localtime(ev["t"]))
-        attr = curses.color_pair(5) if ev["event"] in ("exit", "update_failed") else 0
-        _safe_addstr(win, bar_y + 10 + i, 4, f"{ts}  {ev['event']:<16} {ev.get('detail','')}", attr)
-
-
-# ------------------------- actions -------------------------
-
-def _action_create(stdscr) -> str | None:
-    name = _prompt(stdscr, "new app name (lowercase, [a-z0-9_-])")
-    if not name:
-        return None
-    desc = _prompt(stdscr, "description (optional)") or ""
-    shell_idx = _menu(stdscr, "shell", ["auto", "bash", "fish"])
-    shell = ["auto", "bash", "fish"][shell_idx] if shell_idx is not None else "auto"
-    try:
-        apps.create(name, shell=shell, description=desc)
-    except Exception as e:
-        _info(stdscr, "error", str(e))
-        return None
-    if _confirm(stdscr, f"edit run script for {name} now?"):
-        apps.edit_script(name, "run")
-    return name
-
-
-def _action_edit(stdscr, name: str) -> None:
-    idx = _menu(stdscr, "edit which script?", ["run", "stop", "update"])
-    if idx is None: return
-    apps.edit_script(name, ["run", "stop", "update"][idx])
-
-
-def _action_logs(stdscr, name: str) -> None:
-    _shell_out(stdscr, ["bash", "-lc",
-                        f"journalctl -u lazy-{name}.service -n 500 --no-pager | less -R +G"])
-
-
-def _action_schedule(stdscr, name: str) -> None:
-    cfg = apps.load(name)
-    options = ["+ add new"] + [f"{s['id']} · {s['spec']}" for s in cfg.get("schedules", [])]
-    idx = _menu(stdscr, f"schedules for {name}", options)
-    if idx is None: return
-    if idx == 0:
-        opts = schedule.list_presets() + ["custom OnCalendar..."]
-        sub = _menu(stdscr, "preset or custom", opts)
-        if sub is None: return
-        if sub == len(opts) - 1:
-            spec = _prompt(stdscr, "OnCalendar expression")
-            if not spec: return
+        # uptime as a colored bar
+        recent = metrics[-min(80, len(metrics)):]
+        if recent:
+            bar = "".join("[green]█[/]" if m.get("active") else "[red]█[/]" for m in recent)
         else:
-            spec = opts[sub]
+            bar = "[dim]no samples yet[/]"
+        self._uptime.update(f"uptime  {bar}")
+
+        counts: dict[str, int] = {}
+        for ev in hist:
+            counts[ev["event"]] = counts.get(ev["event"], 0) + 1
+        self._summary.update(
+            f"cpu {cur_cpu:.1f}%  ram {_fmt_bytes(cur_rss)}  · "
+            f"restarts: {counts.get('restart',0)}  failures: {counts.get('exit',0)}  "
+            f"updates: {counts.get('update_ok',0)}/{counts.get('update_failed',0)} fail  "
+            f"webhooks: {counts.get('webhook',0)}"
+        )
+
+        scheds = cfg.get("schedules", [])
+        sched_str = ", ".join(f"[bold]{s['spec']}[/]" for s in scheds) or "[dim](none)[/]"
+        self._sched.update(f"schedules: {sched_str}")
+
+        g = config.load()
+        if cfg.get("webhook_enabled", True):
+            wh = f"http://localhost:{g['webhook_port']}/hook/{name}/{cfg['token']}?action=update"
+            self._webhook.update(f"webhook: {wh}")
+        else:
+            self._webhook.update("[dim]webhook disabled[/]")
+
+        env = cfg.get("env", {})
+        self._env.update("env: " + (" ".join(f"{k}=…" for k in env) if env else "[dim](none)[/]"))
+
+        lim = cfg.get("limits", {}) or {}
+        if lim:
+            self._limits.update("limits: " + " ".join(f"[b]{k}[/]={v}" for k, v in lim.items()))
+        else:
+            self._limits.update("[dim]limits: (none)[/]")
+
+        # history table
+        self._history_table.clear()
+        for ev in reversed(hist[-80:]):
+            ts = time.strftime("%m-%d %H:%M:%S", time.localtime(ev["t"]))
+            self._history_table.add_row(ts, ev["event"], ev.get("detail", ""))
+
+        self._refresh_logs(initial)
+
+    def _refresh_logs(self, initial: bool) -> None:
+        name = self.app_name
+        if not name or not self._log:
+            return
+        p = log_path(name)
+        if p.exists():
+            try:
+                size = p.stat().st_size
+            except OSError:
+                return
+            if initial or size < self._log_offset:
+                # first paint, or file truncated/rotated: show last ~300 lines
+                tail = _read_log_tail(name, lines=300)
+                self._log.clear()
+                self._log.write(tail or "[dim](no output yet)[/]")
+                self._log_offset = size
+                return
+            if size > self._log_offset:
+                try:
+                    with p.open("rb") as f:
+                        f.seek(self._log_offset)
+                        chunk = f.read(size - self._log_offset).decode("utf-8", errors="replace")
+                except OSError:
+                    return
+                if chunk:
+                    self._log.write(chunk.rstrip("\n"))
+                self._log_offset = size
+        elif initial:
+            # no per-app file (save_logs disabled): seed once from journal
+            self._log.clear()
+            self._log.write(_read_log_tail(name, lines=300))
+
+
+# ============================ main app ============================
+
+class LazyApp(App):
+    CSS = """
+    Screen { layout: horizontal; }
+    #sidebar { width: 32; border-right: solid $primary-darken-1; }
+    #sidebar > Label { padding: 1 1 0 1; text-style: bold; }
+    #sidebar-toolbar { height: 3; padding: 0 1; }
+    #sidebar-toolbar Button { margin-right: 1; min-width: 6; }
+    #applist { height: 1fr; }
+    Detail { width: 1fr; }
+    """
+
+    BINDINGS = [
+        Binding("n", "new", "new"),
+        Binding("s", "start", "start"),
+        Binding("x", "stop", "stop"),
+        Binding("r", "restart", "restart"),
+        Binding("u", "update", "update"),
+        Binding("e", "edit", "edit"),
+        Binding("E", "env", "env"),
+        Binding("L", "limits", "limits"),
+        Binding("t", "schedule", "sched"),
+        Binding("w", "webhook", "webhook"),
+        Binding("l", "logs_full", "logs"),
+        Binding("delete", "delete", "delete"),
+        Binding("D", "delete", "delete", show=False),
+        Binding("g", "settings", "settings"),
+        Binding("/", "filter", "filter"),
+        Binding("?", "help", "help"),
+        Binding("q", "quit", "quit"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.filter_str = ""
+        self.detail: Detail | None = None
+        self.list_view: ListView | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal():
+            with Vertical(id="sidebar"):
+                yield Label("apps")
+                with Horizontal(id="sidebar-toolbar"):
+                    yield Button("+ New",     id="b-new",      variant="primary")
+                    yield Button("Filter",    id="b-filter")
+                    yield Button("Settings",  id="b-settings")
+                    yield Button("?",         id="b-help")
+                yield ListView(id="applist")
+            self.detail = Detail()
+            yield self.detail
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = "lazy-system"
+        self._update_subtitle()
+        self.list_view = self.query_one("#applist", ListView)
+        self.refresh_list()
+        self.set_interval(POLL_DETAIL_S, self._tick_detail)
+        self.set_interval(POLL_LIST_S, self.refresh_list)
+
+    def _update_subtitle(self) -> None:
+        cfg = config.load()
+        auth_label = "🔒 auth" if cfg.get("web_password") else "⚠ no-password (loopback only)"
+        self.sub_title = f"web :{cfg['webhook_port']} · {auth_label}"
+
+    def _tick_detail(self) -> None:
+        if self.detail and self.detail.app_name:
+            try:
+                self.detail.refresh_data()
+            except Exception:
+                pass
+
+    def refresh_list(self) -> None:
+        names = [n for n in apps.list_apps() if self.filter_str.lower() in n.lower()]
+        statuses = {n: apps.is_active(n) for n in names}
+        prev = self._current_name()
+        self.list_view.clear()
+        for name in names:
+            self.list_view.append(AppRow(name, statuses.get(name, False)))
+        if prev and prev in names:
+            self.list_view.index = names.index(prev)
+        elif names:
+            self.list_view.index = 0
+        self._sync_detail()
+        self._update_subtitle()
+
+    def _current_name(self) -> str | None:
+        if not self.list_view or self.list_view.index is None:
+            return None
+        if self.list_view.index < 0 or self.list_view.index >= len(self.list_view.children):
+            return None
+        item = self.list_view.children[self.list_view.index]
+        return getattr(item, "name_", None)
+
+    def _sync_detail(self) -> None:
+        name = self._current_name()
+        if self.detail and self.detail.app_name != name:
+            self.detail.set_app(name)
+
+    @on(ListView.Highlighted)
+    def _on_highlight(self, _) -> None:
+        self._sync_detail()
+
+    @on(Button.Pressed)
+    def _on_button(self, ev: Button.Pressed) -> None:
+        bid = ev.button.id or ""
+        actions = {
+            "b-start": self.action_start, "b-stop": self.action_stop,
+            "b-restart": self.action_restart, "b-update": self.action_update,
+            "b-edit": self.action_edit, "b-env": self.action_env,
+            "b-limits": self.action_limits, "b-schedule": self.action_schedule,
+            "b-webhook": self.action_webhook, "b-logs-full": self.action_logs_full,
+            "b-delete": self.action_delete,
+            "b-new": self.action_new, "b-settings": self.action_settings,
+            "b-filter": self.action_filter, "b-help": self.action_help,
+        }
+        fn = actions.get(bid)
+        if fn: fn()
+
+    # ---------- actions ----------
+
+    def _need(self) -> str | None:
+        n = self._current_name()
+        if not n:
+            self.notify("no app selected", severity="warning")
+        return n
+
+    def action_start(self) -> None:
+        name = self._need()
+        if not name: return
+        try: apps.start(name); self.notify(f"started {name}")
+        except Exception as e: self.notify(str(e), severity="error")
+
+    def action_stop(self) -> None:
+        name = self._need()
+        if not name: return
+        try: apps.stop(name); self.notify(f"stopped {name}")
+        except Exception as e: self.notify(str(e), severity="error")
+
+    def action_restart(self) -> None:
+        name = self._need()
+        if not name: return
+        try: apps.restart(name); self.notify(f"restarted {name}")
+        except Exception as e: self.notify(str(e), severity="error")
+
+    def action_update(self) -> None:
+        name = self._need()
+        if not name: return
+        def go(ok: bool) -> None:
+            if not ok: return
+            self.notify(f"updating {name}…")
+            rc = apps.run_update(name)
+            if rc == 0: self.notify(f"{name} updated")
+            else:       self.notify(f"update failed (rc={rc})", severity="error")
+        self.push_screen(ConfirmScreen(f"Update {name}? (stop → update → start)"), go)
+
+    def action_edit(self) -> None:
+        name = self._need()
+        if not name: return
+        def picked(kind: str | None) -> None:
+            if not kind: return
+            with self.suspend():
+                apps.edit_script(name, kind)
+        self.push_screen(ChoiceScreen("Edit which script?",
+                                      [("run", "run"), ("stop", "stop"), ("update", "update")]), picked)
+
+    def action_env(self) -> None:
+        name = self._need()
+        if not name: return
+        cfg = apps.load(name)
+        env = cfg.get("env", {})
+        opts: list[tuple[str, str]] = [("__add__", "+ add or update KEY=VALUE")]
+        opts += [(f"rm:{k}", f"✕ remove {k}={v}") for k, v in env.items()]
+        def picked(choice: str | None) -> None:
+            if not choice: return
+            if choice == "__add__":
+                self.push_screen(PromptScreen("KEY=VALUE", placeholder="API_KEY=..."), self._add_env)
+            elif choice.startswith("rm:"):
+                k = choice[3:]
+                apps.set_env(name, k, None)
+                self.notify(f"removed {k}")
+        self.push_screen(ChoiceScreen(f"Env vars · {name}", opts), picked)
+
+    def _add_env(self, kv: str | None) -> None:
+        name = self._current_name()
+        if not name or not kv or "=" not in kv: return
+        k, v = kv.split("=", 1)
+        apps.set_env(name, k.strip(), v)
+        self.notify(f"set {k.strip()}")
+
+    def action_limits(self) -> None:
+        name = self._need()
+        if not name: return
+        cfg = apps.load(name)
+        def saved(result: dict | None) -> None:
+            if result is None: return
+            try:
+                apps.set_limits(name, **result)
+                self.notify(f"limits updated for {name}")
+            except Exception as e:
+                self.notify(str(e), severity="error")
+        self.push_screen(LimitsScreen(cfg.get("limits", {}) or {}), saved)
+
+    def action_schedule(self) -> None:
+        name = self._need()
+        if not name: return
+        cfg = apps.load(name)
+        opts: list[tuple[str, str]] = [("__add__", "+ add new schedule")]
+        opts += [(f"rm:{s['id']}", f"✕ {s['spec']}  ({s['oncalendar']})")
+                 for s in cfg.get("schedules", [])]
+        def picked(choice: str | None) -> None:
+            if not choice: return
+            if choice == "__add__":
+                preset_opts = [(p, f"{p}  →  {schedule.PRESETS[p]}") for p in schedule.list_presets()]
+                preset_opts.append(("__custom__", "custom OnCalendar…"))
+                self.push_screen(ChoiceScreen("preset", preset_opts), self._add_sched)
+            elif choice.startswith("rm:"):
+                apps.remove_schedule(name, choice[3:])
+                self.notify("schedule removed")
+        self.push_screen(ChoiceScreen(f"Schedules · {name}", opts), picked)
+
+    def _add_sched(self, choice: str | None) -> None:
+        name = self._current_name()
+        if not name or not choice: return
+        if choice == "__custom__":
+            self.push_screen(PromptScreen("OnCalendar expression",
+                                          placeholder="Mon..Fri 09:00"), self._add_sched_raw)
+        else:
+            try:
+                apps.add_schedule(name, choice)
+                self.notify(f"added {choice}")
+            except Exception as e:
+                self.notify(str(e), severity="error")
+
+    def _add_sched_raw(self, spec: str | None) -> None:
+        name = self._current_name()
+        if not name or not spec: return
         try:
             apps.add_schedule(name, spec)
+            self.notify("schedule added")
         except Exception as e:
-            _info(stdscr, "error", str(e))
-    else:
-        sid = cfg["schedules"][idx - 1]["id"]
-        if _confirm(stdscr, f"remove schedule {sid}?"):
-            apps.remove_schedule(name, sid)
+            self.notify(str(e), severity="error")
 
-
-def _action_env(stdscr, name: str) -> None:
-    cfg = apps.load(name)
-    while True:
-        items = [f"{k}={v}" for k, v in cfg.get("env", {}).items()]
-        opts = ["+ add/update"] + items + (["✕ remove all"] if items else []) + ["done"]
-        idx = _menu(stdscr, f"env vars · {name}", opts)
-        if idx is None or opts[idx] == "done": return
-        if idx == 0:
-            kv = _prompt(stdscr, "KEY=VALUE")
-            if not kv or "=" not in kv:
-                continue
-            k, v = kv.split("=", 1)
-            apps.set_env(name, k.strip(), v)
-        elif idx == len(opts) - 2 and items:
-            for k in list(cfg.get("env", {})):
-                apps.set_env(name, k, None)
-        else:
-            k = items[idx - 1].split("=", 1)[0]
-            if _confirm(stdscr, f"remove {k}?"):
-                apps.set_env(name, k, None)
+    def action_webhook(self) -> None:
+        name = self._need()
+        if not name: return
         cfg = apps.load(name)
+        g = config.load()
+        base = f"http://<host>:{g['webhook_port']}/hook/{name}/{cfg['token']}"
+        body = "\n".join([
+            "Per-app token, no basic auth required:",
+            "",
+            f"  update:  {base}?action=update",
+            f"  start:   {base}?action=start",
+            f"  stop:    {base}?action=stop",
+            f"  restart: {base}?action=restart",
+            "",
+            "GET or POST both work.",
+        ])
+        self.push_screen(InfoScreen(f"webhook · {name}", body))
 
-
-def _action_webhook(stdscr, name: str) -> None:
-    cfg = apps.load(name)
-    g = config.load()
-    base = f"http://<host>:{g['webhook_port']}/hook/{name}/{cfg['token']}"
-    text = "\n".join([
-        "Webhook URLs (per-app token, no basic auth required):",
-        "",
-        f"  update:  {base}?action=update",
-        f"  start:   {base}?action=start",
-        f"  stop:    {base}?action=stop",
-        f"  restart: {base}?action=restart",
-        "",
-        "GET or POST — both work.",
-    ])
-    _info(stdscr, f"webhook · {name}", text)
-
-
-def _action_settings(stdscr) -> None:
-    while True:
-        cfg = config.load()
-        opts = [
-            f"web port           [{cfg['webhook_port']}]",
-            f"web bind address   [{cfg['web_bind']}]",
-            f"web username       [{cfg['web_user']}]",
-            f"set web password   [{'set' if cfg.get('web_password') else 'NOT SET'}]",
-            f"clear web password",
-            f"save logs to file  [{'yes' if cfg['save_logs'] else 'no'}]",
-            f"default shell      [{cfg['shell']}]",
-            f"metrics interval   [{cfg['metrics_interval_seconds']}s]",
-            f"export all apps    →",
-            f"import an app      →",
-            f"doctor (check + fix)",
-            "done",
-        ]
-        idx = _menu(stdscr, "global settings", opts)
-        if idx is None or opts[idx] == "done": return
-        new = dict(cfg)
-        regenerate = False
-        restart_web = False
-        if idx == 0:
-            v = _prompt(stdscr, "web port", str(cfg["webhook_port"]))
-            if v and v.isdigit(): new["webhook_port"] = int(v); restart_web = True
-        elif idx == 1:
-            v = _prompt(stdscr, "bind address (0.0.0.0 or 127.0.0.1)", cfg["web_bind"])
-            if v: new["web_bind"] = v; restart_web = True
-        elif idx == 2:
-            v = _prompt(stdscr, "username", cfg["web_user"])
-            if v: new["web_user"] = v
-        elif idx == 3:
-            p1 = _prompt(stdscr, "new password", secret=True)
-            if not p1: continue
-            p2 = _prompt(stdscr, "confirm", secret=True)
-            if p1 != p2:
-                _info(stdscr, "error", "passwords do not match"); continue
-            new["web_password"] = auth.hash_password(p1)
-        elif idx == 4:
-            if _confirm(stdscr, "really clear web password? web UI will be loopback-only"):
-                new["web_password"] = None
-        elif idx == 5:
-            new["save_logs"] = not cfg["save_logs"]
-            regenerate = True
-        elif idx == 6:
-            sub = _menu(stdscr, "default shell", ["auto", "bash", "fish"])
-            if sub is not None: new["shell"] = ["auto", "bash", "fish"][sub]
-        elif idx == 7:
-            v = _prompt(stdscr, "metrics interval (seconds)", str(cfg["metrics_interval_seconds"]))
-            if v and v.isdigit(): new["metrics_interval_seconds"] = max(1, int(v))
-        elif idx == 8:
-            for n in apps.list_apps():
-                p = apps.export_app(n, "/var/lib/lazy-system")
-                _info(stdscr, "exported", p)
-            continue
-        elif idx == 9:
-            path = _prompt(stdscr, "path to .tar.gz")
-            if not path: continue
-            try:
-                imported = apps.import_app(path)
-                _info(stdscr, "imported", f"app: {imported}")
-            except Exception as e:
-                _info(stdscr, "error", str(e))
-            continue
-        elif idx == 10:
-            issues = apps.doctor()
-            if not issues:
-                _info(stdscr, "doctor", "no issues")
+    def action_logs_full(self) -> None:
+        name = self._need()
+        if not name: return
+        p = log_path(name)
+        with self.suspend():
+            if p.exists():
+                # clean app stdout — tail -F follows rotations and truncation
+                subprocess.run(["bash", "-lc", f"tail -n 500 -F '{p}'"])
             else:
-                _info(stdscr, "doctor", "\n".join(f"[{lvl}] {n}: {m}" for lvl, n, m in issues))
-            if _confirm(stdscr, "regenerate all unit files?"):
-                n = apps.fix_units()
-                _info(stdscr, "doctor", f"regenerated {n} unit set(s)")
-            continue
-        config.save(new)
-        if regenerate:
-            apps.regenerate_all_units()
-        if restart_web:
-            subprocess.run(["systemctl", "restart", "lazy-webhook.service"], check=False)
+                subprocess.run(["bash", "-lc",
+                    f"journalctl -u lazy-{name}.service -n 500 -f -o cat"])
 
+    def action_delete(self) -> None:
+        name = self._need()
+        if not name: return
+        def go(ok: bool) -> None:
+            if not ok: return
+            apps.remove(name)
+            self.notify(f"deleted {name}", severity="warning")
+            self.refresh_list()
+        self.push_screen(ConfirmScreen(f"Permanently delete '{name}'?", danger=True), go)
 
-def _help_text() -> str:
-    return ("\n".join(f"{k:<8} {v}" for k, v in KEYMAP) +
-            "\n\nlazy-system: one app = three scripts (run/stop/update).\n"
-            "Updates always run: stop → update → start.\n"
-            "Webhook URLs use per-app tokens; web UI uses basic auth.")
-
-
-# ------------------------- main loop -------------------------
-
-def _main(stdscr) -> None:
-    curses.curs_set(0)
-    curses.use_default_colors()
-    curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN, -1)
-    curses.init_pair(2, curses.COLOR_CYAN, -1)
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)
-    curses.init_pair(4, curses.COLOR_GREEN, -1)
-    curses.init_pair(5, curses.COLOR_RED, -1)
-    stdscr.nodelay(True)
-    stdscr.timeout(int(TICK * 1000))
-
-    sel = 0
-    filter_str = ""
-    last_status_check = 0.0
-    statuses: dict[str, bool] = {}
-
-    while True:
-        all_names = apps.list_apps()
-        names = [n for n in all_names if filter_str.lower() in n.lower()]
-        if sel >= len(names): sel = max(0, len(names) - 1)
-
-        # rate-limit systemctl calls
-        if time.time() - last_status_check > 2:
-            statuses = {n: apps.is_active(n) for n in all_names}
-            last_status_check = time.time()
-
-        h, w = stdscr.getmaxyx()
-        stdscr.erase()
-        if h < 12 or w < 60:
-            _safe_addstr(stdscr, 0, 0, "terminal too small")
-            stdscr.refresh()
-        else:
-            running = sum(1 for n in all_names if statuses.get(n))
-            _draw_header(stdscr, len(all_names), running)
-            sb_w = min(28, w // 4)
-            sidebar = stdscr.derwin(h - 2, sb_w, 1, 0)
-            detail  = stdscr.derwin(h - 2, w - sb_w, 1, sb_w)
-            _draw_sidebar(sidebar, names, sel, filter_str, statuses)
-            _draw_detail(detail, names[sel] if names else None)
-            _draw_footer(stdscr)
-            stdscr.refresh()
-
-        try:
-            c = stdscr.get_wch()
-        except curses.error:
-            continue
-
-        cur = names[sel] if names else None
-
-        if c in (curses.KEY_UP, "k") and names: sel = (sel - 1) % len(names)
-        elif c in (curses.KEY_DOWN, "j") and names: sel = (sel + 1) % len(names)
-        elif c == "q": return
-        elif c == "?": _info(stdscr, "help", _help_text())
-        elif c == "n":
-            new_name = _action_create(stdscr)
-            if new_name and new_name in apps.list_apps():
-                sel = apps.list_apps().index(new_name)
-        elif c == "/":
-            v = _prompt(stdscr, "filter", filter_str)
-            filter_str = v or ""
-            sel = 0
-        elif c == "g":
-            _action_settings(stdscr)
-        elif cur:
+    def action_new(self) -> None:
+        def created(result: dict | None) -> None:
+            if not result or not result.get("name"): return
             try:
-                if c == "s": apps.start(cur)
-                elif c == "x": apps.stop(cur)
-                elif c == "r": apps.restart(cur)
-                elif c == "u":
-                    if _confirm(stdscr, f"update {cur} now? (stop → update → start)"):
-                        rc = apps.run_update(cur)
-                        if rc != 0:
-                            _info(stdscr, "update", f"update failed (rc={rc}); see logs")
-                elif c == "e": _action_edit(stdscr, cur)
-                elif c == "E": _action_env(stdscr, cur)
-                elif c == "l": _action_logs(stdscr, cur)
-                elif c == "t": _action_schedule(stdscr, cur)
-                elif c == "w": _action_webhook(stdscr, cur)
-                elif c == "D":
-                    if _confirm(stdscr, f"PERMANENTLY remove {cur}?"):
-                        apps.remove(cur)
-                elif c in (10, 13, "\n"): _info(stdscr, cur, apps.status_text(cur))
-            except subprocess.CalledProcessError as e:
-                _info(stdscr, "systemctl error", str(e))
+                apps.create(result["name"], shell=result["shell"], description=result["description"])
+                self.notify(f"created {result['name']}")
+                self.refresh_list()
             except Exception as e:
-                _info(stdscr, "error", str(e))
+                self.notify(str(e), severity="error")
+        self.push_screen(NewAppScreen(), created)
+
+    def action_filter(self) -> None:
+        def got(v: str | None) -> None:
+            self.filter_str = v or ""
+            self.refresh_list()
+        self.push_screen(PromptScreen("filter apps", default=self.filter_str), got)
+
+    def action_settings(self) -> None:
+        def done(_): self._update_subtitle()
+        self.push_screen(SettingsScreen(), done)
+
+    def action_help(self) -> None:
+        body = "\n".join([
+            "Keyboard:",
+            "",
+            *(f"  {b.key:<10} {b.description}" for b in self.BINDINGS if b.show),
+            "",
+            "Mouse:",
+            "  click in the sidebar to select an app",
+            "  click action buttons in the detail panel",
+            "  click tabs (Overview / History / Logs)",
+            "",
+            "lazy-system: one app = three scripts (run / stop / update).",
+            "Updates always run: stop → update → start.",
+        ])
+        self.push_screen(InfoScreen("help", body))
 
 
 def run() -> None:
     _need_root_or_die()
-    # if no password is set and bind is non-loopback, prompt now
-    cfg = config.load()
-    if not cfg.get("web_password") and cfg.get("web_bind", "0.0.0.0") != "127.0.0.1":
-        print("lazy-system: web UI has no password set yet — it will only accept loopback")
-        print("             connections. Set one in TUI → 'g' settings → 'set web password'.")
-        try:
-            input("press Enter to continue, Ctrl-C to abort...")
-        except KeyboardInterrupt:
-            return
-    curses.wrapper(_main)
+    LazyApp().run()
 
 
 if __name__ == "__main__":
