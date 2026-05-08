@@ -32,10 +32,44 @@ fi
 "$VENV/bin/pip" install --upgrade pip wheel --quiet
 "$VENV/bin/pip" install --quiet textual psutil
 
-echo "==> Copying source"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-rm -rf "$PREFIX/lazy_system"
-cp -r "$SRC_DIR/lazy_system" "$PREFIX/"
+NEED_RESTART=0
+
+stop_services_once() {
+    if [[ "${SERVICES_STOPPED:-0}" == "1" ]]; then return; fi
+    SERVICES_STOPPED=1
+    for svc in lazy-webhook.service lazy-monitor.service; do
+        if systemctl list-unit-files "$svc" >/dev/null 2>&1 \
+            && systemctl is-active --quiet "$svc"; then
+            echo "==> Stopping $svc"
+            systemctl stop "$svc" || true
+        fi
+    done
+}
+
+write_if_changed() {
+    # write_if_changed <dest> <content-on-stdin>
+    local dest="$1"
+    local tmp
+    tmp="$(mktemp)"
+    cat >"$tmp"
+    if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$dest"
+    return 0
+}
+
+echo "==> Syncing source"
+if [[ -d "$PREFIX/lazy_system" ]] && diff -rq "$SRC_DIR/lazy_system" "$PREFIX/lazy_system" >/dev/null 2>&1; then
+    echo "    source unchanged"
+else
+    stop_services_once
+    rm -rf "$PREFIX/lazy_system"
+    cp -r "$SRC_DIR/lazy_system" "$PREFIX/"
+    NEED_RESTART=1
+fi
 
 # Make package importable from venv python
 SITE_DIR="$("$VENV/bin/python" -c 'import site,sys; print(site.getsitepackages()[0])')"
@@ -43,11 +77,13 @@ mkdir -p "$SITE_DIR"
 echo "$PREFIX" >"$SITE_DIR/lazy_system.pth"
 
 echo "==> Installing CLI shim"
-cat >"$BIN" <<EOF
+if cat <<EOF | write_if_changed "$BIN"
 #!/usr/bin/env bash
 exec $VENV/bin/python -m lazy_system.cli "\$@"
 EOF
-chmod +x "$BIN"
+then
+    chmod +x "$BIN"
+fi
 ln -sf "$BIN" "$ALIAS"
 
 echo "==> Seeding global config"
@@ -67,7 +103,8 @@ EOF
 fi
 
 echo "==> Installing systemd units"
-cat >/etc/systemd/system/lazy-webhook.service <<EOF
+UNITS_CHANGED=0
+if cat <<EOF | write_if_changed /etc/systemd/system/lazy-webhook.service
 [Unit]
 Description=lazy-system webhook + dashboard
 After=network-online.target
@@ -82,8 +119,11 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+then
+    UNITS_CHANGED=1
+fi
 
-cat >/etc/systemd/system/lazy-monitor.service <<EOF
+if cat <<EOF | write_if_changed /etc/systemd/system/lazy-monitor.service
 [Unit]
 Description=lazy-system resource monitor
 After=multi-user.target
@@ -97,8 +137,15 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+then
+    UNITS_CHANGED=1
+fi
 
-systemctl daemon-reload
+if [[ "$UNITS_CHANGED" == "1" ]]; then
+    stop_services_once
+    NEED_RESTART=1
+    systemctl daemon-reload
+fi
 
 # ----- password prompt -----
 NEED_PW=1
@@ -142,7 +189,14 @@ os.replace(path + ".tmp", path)
     done
 fi
 
-systemctl enable --now lazy-webhook.service lazy-monitor.service >/dev/null
+systemctl enable lazy-webhook.service lazy-monitor.service >/dev/null 2>&1 || true
+if [[ "$NEED_RESTART" == "1" ]]; then
+    echo "==> Restarting services"
+    systemctl restart lazy-webhook.service lazy-monitor.service
+else
+    # ensure they're running even if no change (first install / manually stopped)
+    systemctl start lazy-webhook.service lazy-monitor.service
+fi
 
 PORT=$("$VENV/bin/python" -c 'import json;print(json.load(open("/etc/lazy-system/config.json"))["webhook_port"])')
 echo
