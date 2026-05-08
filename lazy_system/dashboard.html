@@ -1,6 +1,10 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>lazy-system</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/date-fns@2.30.0/index.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
   :root { color-scheme: dark; }
   body { font: 14px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;
@@ -17,30 +21,44 @@
   .dot { width:8px; height:8px; border-radius:50%; background:#374151; }
   .dot.up { background:#10b981; }
   section { padding: 18px 24px; overflow:auto; }
-  .row { display:flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .row { display:flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; align-items:center; }
   button { background:#1f2937; color:#e5e7eb; border:1px solid #374151;
-           padding: 6px 12px; border-radius: 6px; cursor:pointer; }
+           padding: 6px 12px; border-radius: 6px; cursor:pointer; font: inherit; }
   button:hover { background:#2b3648; }
+  button.primary { border-color:#1d4ed8; }
   button.danger { border-color:#7f1d1d; }
   .card { background:#151a24; border:1px solid #222a36; border-radius:10px;
           padding: 14px 16px; }
+  .card + .card { margin-top: 16px; }
   .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  .uptime { display:flex; gap:1px; height:18px; background:#0b0e14;
-            border-radius:4px; overflow:hidden; }
-  .uptime span { flex:1; }
-  .uptime .ok  { background:#10b981; }
-  .uptime .bad { background:#ef4444; }
-  .uptime .gap { background:#374151; }
-  pre { background:#0b0e14; border:1px solid #222a36; padding:10px;
-        max-height: 320px; overflow:auto; font: 12px/1.4 ui-monospace,Menlo,monospace; }
+  .chart-wrap { position: relative; height: 160px; }
+  .chart-wrap.tall { height: 220px; }
+  .chart-hint { color:#6b7280; font-size: 11px; margin-top: 4px; }
+  pre, textarea { background:#0b0e14; border:1px solid #222a36; padding:10px;
+                  font: 12px/1.4 ui-monospace,Menlo,monospace; color:#e5e7eb;
+                  border-radius: 6px; box-sizing: border-box; }
+  pre.logs { max-height: 360px; overflow:auto; white-space: pre-wrap; word-break: break-word; }
+  textarea.script { width:100%; min-height: 220px; resize: vertical; }
   table { width:100%; border-collapse: collapse; }
   td { padding: 4px 8px; border-bottom: 1px solid #222a36; vertical-align: top; }
-  small { color:#9ca3af; }
+  small, .muted { color:#9ca3af; }
   input, select { background:#0b0e14; color:#e5e7eb; border:1px solid #374151;
-                  padding:6px 8px; border-radius:6px; }
+                  padding:6px 8px; border-radius:6px; font: inherit; }
   .pill { background:#1f2937; padding:2px 8px; border-radius:999px; font-size:12px;
           margin-right: 4px; }
   .empty { color:#6b7280; padding: 20px; }
+  .tabs { display:flex; gap:6px; margin-bottom: 10px; }
+  .tabs button.active { background:#1f2a44; border-color:#1d4ed8; }
+  .save-state { font-size: 12px; color:#9ca3af; margin-left: 8px; }
+  .save-state.dirty { color:#f59e0b; }
+  .save-state.saved { color:#10b981; }
+  .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display:flex;
+              align-items:center; justify-content:center; z-index: 50; }
+  .modal { background:#151a24; border:1px solid #222a36; border-radius:10px;
+           padding: 20px; width: min(520px, 92vw); }
+  .modal h3 { margin: 0 0 12px; }
+  .modal .field { margin-bottom: 10px; display:flex; flex-direction:column; gap: 4px; }
+  .modal .field input { width: 100%; box-sizing: border-box; }
 </style></head><body>
 <header>
   <h1>lazy-system</h1>
@@ -55,8 +73,17 @@
 </main>
 
 <script>
+const RETENTION_DAYS = 3;
+const RETENTION_S = RETENTION_DAYS * 86400;
+
 let current = null;
 let charts = {};
+let appsCache = [];
+let scriptDirty = {};       // {kind: bool}
+let scriptLoaded = {};      // {kind: lastSavedContent}
+let activeScriptKind = 'run';
+let lastHistorySig = '';
+let pollTimer = null;
 
 async function api(path, opts={}) {
   const r = await fetch(path, opts);
@@ -67,6 +94,7 @@ async function api(path, opts={}) {
 
 async function loadApps() {
   const apps = await api('/api/apps');
+  appsCache = apps;
   const aside = document.getElementById('apps');
   aside.innerHTML = '';
   if (!apps.length) {
@@ -76,16 +104,14 @@ async function loadApps() {
   for (const a of apps) {
     const el = document.createElement('div');
     el.className = 'app' + (current === a.name ? ' active' : '');
-    el.innerHTML = `<span>${a.name}</span><span class="dot ${a.active?'up':''}"></span>`;
+    el.innerHTML = `<span>${escapeHtml(a.name)}</span><span class="dot ${a.active?'up':''}"></span>`;
     el.onclick = () => selectApp(a.name);
     aside.appendChild(el);
   }
 }
 
-async function selectApp(name) {
-  current = name;
-  await loadApps();
-  await renderDetail();
+function escapeHtml(s) {
+  return String(s).replace(/[<&>"']/g, c => ({'<':'&lt;','&':'&amp;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function fmtBytes(b) {
@@ -95,97 +121,372 @@ function fmtBytes(b) {
   return (b/1024/1024/1024).toFixed(2)+' GB';
 }
 
-function renderUptime(metrics, history) {
-  // bucket the last N samples into a bar
-  const buckets = metrics.slice(-120);
-  const evs = history.reduce((m,h)=> (m[h.event]=(m[h.event]||0)+1, m), {});
-  const html = buckets.map(s => `<span class="${s.active?'ok':'bad'}" title="${new Date(s.t*1000).toLocaleString()}"></span>`).join('');
-  return `<div class="uptime">${html||'<span class="gap"></span>'}</div>
-          <small>restarts: ${evs.restart||0} · failures: ${evs.exit||0} · updates: ${evs.update_ok||0} (${evs.update_failed||0} failed)</small>`;
+function selectApp(name) {
+  if (current === name) return;
+  if (anyScriptDirty() && !confirm('Unsaved script changes will be lost. Switch app?')) return;
+  current = name;
+  scriptDirty = {}; scriptLoaded = {}; activeScriptKind = 'run';
+  lastHistorySig = '';
+  destroyCharts();
+  buildSkeleton();
+  loadApps();
+  refreshDetail();
+  loadScripts();
 }
 
-function buildChart(canvas, label, data, color, fmt) {
-  if (charts[canvas.id]) charts[canvas.id].destroy();
-  charts[canvas.id] = new Chart(canvas, {
-    type: 'line',
-    data: { labels: data.map(p=>new Date(p.t*1000).toLocaleTimeString()),
-            datasets: [{ label, data: data.map(fmt), borderColor: color,
-                         backgroundColor: color+'30', tension:0.25, pointRadius:0, fill:true }] },
-    options: { animation:false, plugins:{legend:{display:false}},
-               scales:{x:{ticks:{maxTicksLimit:6,color:'#9ca3af'},grid:{color:'#1f2937'}},
-                       y:{beginAtZero:true,ticks:{color:'#9ca3af'},grid:{color:'#1f2937'}}}}
+function anyScriptDirty() {
+  return Object.values(scriptDirty).some(Boolean);
+}
+
+function destroyCharts() {
+  for (const k in charts) charts[k].destroy();
+  charts = {};
+}
+
+function buildSkeleton() {
+  const a = appsCache.find(x => x.name === current) || {name: current};
+  const detail = document.getElementById('detail');
+  detail.className = '';
+  detail.innerHTML = `
+    <h2 style="margin:0 0 4px"><span id="d-name">${escapeHtml(current)}</span> <small id="d-state"></small></h2>
+    <small id="d-desc"></small>
+    <div class="row" style="margin-top:12px">
+      <button onclick="act('start')">Start</button>
+      <button onclick="act('stop')">Stop</button>
+      <button onclick="act('restart')">Restart</button>
+      <button class="primary" onclick="act('update')">Update now</button>
+      <button class="danger" onclick="del()">Delete</button>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <b>Uptime</b>
+        <button onclick="resetZoom('uptime')" title="reset zoom">⤺ reset</button>
+      </div>
+      <div class="chart-wrap"><canvas id="uptime"></canvas></div>
+      <div class="chart-hint">scroll to zoom · drag to pan · keeps up to ${RETENTION_DAYS} days</div>
+      <div id="d-counts" style="margin-top:8px"></div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <b>CPU %</b>
+          <button onclick="resetZoom('cpu')">⤺ reset</button>
+        </div>
+        <div class="chart-wrap tall"><canvas id="cpu"></canvas></div>
+      </div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <b>RAM</b>
+          <button onclick="resetZoom('ram')">⤺ reset</button>
+        </div>
+        <div class="chart-wrap tall"><canvas id="ram"></canvas></div>
+      </div>
+    </div>
+    <div class="card">
+      <div><b>Schedules</b> <span id="d-sched"></span></div>
+      <div style="margin-top:8px"><b>Webhook</b> <code id="d-hook"></code></div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <b>Scripts</b>
+        <span><span id="script-state" class="save-state"></span>
+          <button class="primary" onclick="saveScript()">Save</button>
+          <button onclick="reloadScript()">Reload</button>
+        </span>
+      </div>
+      <div class="tabs" id="script-tabs">
+        <button data-kind="run" class="active" onclick="switchScript('run')">run</button>
+        <button data-kind="stop" onclick="switchScript('stop')">stop</button>
+        <button data-kind="update" onclick="switchScript('update')">update</button>
+      </div>
+      <textarea id="script-area" class="script" spellcheck="false" placeholder="loading…"></textarea>
+      <div class="chart-hint">edits are saved to disk; restart/update the app to take effect</div>
+    </div>
+    <div class="card">
+      <div><b>Logs</b> <small>(last 500 lines, kept up to ${RETENTION_DAYS} days)</small></div>
+      <pre id="d-logs" class="logs"></pre>
+    </div>
+    <div class="card">
+      <b>History</b>
+      <table id="d-history"></table>
+    </div>
+  `;
+  document.getElementById('script-area').addEventListener('input', () => {
+    scriptDirty[activeScriptKind] = true;
+    renderSaveState();
   });
 }
 
-async function renderDetail() {
+function makeChart(canvasId, kind, label, color) {
+  const ctx = document.getElementById(canvasId);
+  const opts = {
+    type: kind === 'uptime' ? 'bar' : 'line',
+    data: { datasets: [{
+      label, data: [],
+      borderColor: color, backgroundColor: kind === 'uptime' ? [] : color + '30',
+      pointRadius: 0, tension: 0.25, fill: kind !== 'uptime',
+      barPercentage: 1.0, categoryPercentage: 1.0,
+    }]},
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      parsing: false, normalized: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: { mode: 'nearest', intersect: false,
+          callbacks: kind === 'uptime' ? {
+            label: (item) => item.parsed.y > 0 ? 'up' : 'down',
+          } : {},
+        },
+        zoom: {
+          pan:  { enabled: true, mode: 'x', modifierKey: null },
+          zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' },
+          limits: { x: { minRange: 30 * 1000 } },
+        },
+      },
+      scales: {
+        x: { type: 'time',
+             time: { tooltipFormat: 'PP HH:mm:ss', displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'MMM d' } },
+             ticks: { color: '#9ca3af', maxTicksLimit: 8 }, grid: { color: '#1f2937' } },
+        y: kind === 'uptime'
+            ? { display: false, min: 0, max: 1 }
+            : { beginAtZero: true, ticks: { color: '#9ca3af' }, grid: { color: '#1f2937' } },
+      },
+    },
+  };
+  return new Chart(ctx, opts);
+}
+
+function ensureCharts() {
+  if (!charts.uptime) charts.uptime = makeChart('uptime', 'uptime', 'up', '#10b981');
+  if (!charts.cpu)    charts.cpu    = makeChart('cpu',    'line',   'cpu%', '#60a5fa');
+  if (!charts.ram)    charts.ram    = makeChart('ram',    'line',   'rss',  '#f59e0b');
+}
+
+function resetZoom(k) { if (charts[k]) charts[k].resetZoom(); }
+
+function updateChart(chart, points, valueFn, opts={}) {
+  const ds = chart.data.datasets[0];
+  ds.data = points.map(p => ({ x: p.t * 1000, y: valueFn(p) }));
+  if (opts.barColors) {
+    ds.backgroundColor = points.map(p => p.active ? '#10b981' : '#ef4444');
+    ds.borderColor = ds.backgroundColor;
+  }
+  chart.update('none');
+}
+
+async function refreshDetail() {
+  if (!current) return;
+  const name = current;
+  let metrics, history, logs;
+  try {
+    [metrics, history, logs] = await Promise.all([
+      api(`/api/${name}/metrics`),
+      api(`/api/${name}/history`),
+      api(`/api/${name}/logs?n=500`),
+    ]);
+  } catch (e) { return; }
+  if (current !== name) return;
+
+  // filter to retention window (defensive: server already trims, but be safe)
+  const cutoff = Date.now()/1000 - RETENTION_S;
+  metrics = metrics.filter(m => m.t >= cutoff);
+  history = history.filter(h => h.t >= cutoff);
+
+  const a = appsCache.find(x => x.name === name) || {};
+  const stateEl = document.getElementById('d-state');
+  if (stateEl) {
+    stateEl.style.color = a.active ? '#10b981' : '#9ca3af';
+    stateEl.textContent = a.active ? 'running' : 'stopped';
+  }
+  const desc = document.getElementById('d-desc');
+  if (desc) desc.textContent = `${a.description || ''}${a.shell ? ' · shell: ' + a.shell : ''}`;
+
+  const sched = (a.schedules || []).map(s => `<span class="pill">${escapeHtml(s.spec)}</span>`).join('') || '<small>none</small>';
+  const schedEl = document.getElementById('d-sched');
+  if (schedEl) schedEl.innerHTML = sched;
+  const hookEl = document.getElementById('d-hook');
+  if (hookEl) {
+    hookEl.textContent = a.webhook_enabled
+      ? `${location.origin}${a.webhook_path}?action=update`
+      : 'disabled';
+  }
+
+  ensureCharts();
+  updateChart(charts.uptime, metrics, p => p.active ? 1 : 0, { barColors: true });
+  updateChart(charts.cpu, metrics, p => p.cpu);
+  updateChart(charts.ram, metrics, p => p.rss / 1024 / 1024);
+
+  const evs = history.reduce((m,h)=> (m[h.event]=(m[h.event]||0)+1, m), {});
+  const counts = document.getElementById('d-counts');
+  if (counts) {
+    counts.innerHTML = `<small>restarts: ${evs.restart||0} · failures: ${evs.exit||0} · updates: ${evs.update_ok||0} (${evs.update_failed||0} failed) · webhooks: ${evs.webhook||0}</small>`;
+  }
+
+  // logs: only update if changed; preserve scroll if user scrolled up
+  const logsEl = document.getElementById('d-logs');
+  if (logsEl && logsEl.dataset.content !== logs) {
+    const atBottom = logsEl.scrollTop + logsEl.clientHeight >= logsEl.scrollHeight - 8;
+    const prevTop = logsEl.scrollTop;
+    logsEl.textContent = logs;
+    logsEl.dataset.content = logs;
+    logsEl.scrollTop = atBottom ? logsEl.scrollHeight : prevTop;
+  }
+
+  // history: only re-render if changed
+  const sig = history.length + ':' + (history.length ? history[history.length-1].t : 0);
+  if (sig !== lastHistorySig) {
+    lastHistorySig = sig;
+    const tbl = document.getElementById('d-history');
+    if (tbl) {
+      tbl.innerHTML = history.slice().reverse().slice(0, 80)
+        .map(h => `<tr><td><small>${new Date(h.t*1000).toLocaleString()}</small></td><td>${escapeHtml(h.event)}</td><td><small>${escapeHtml(h.detail||'')}</small></td></tr>`).join('');
+    }
+  }
+}
+
+async function loadScripts() {
+  if (!current) return;
+  try {
+    const all = await api(`/api/${current}/scripts`);
+    for (const k of ['run','stop','update']) {
+      scriptLoaded[k] = (all[k] && all[k].content) || '';
+      scriptDirty[k] = false;
+    }
+  } catch (e) {
+    return;
+  }
+  showActiveScript();
+}
+
+function showActiveScript() {
+  const ta = document.getElementById('script-area');
+  if (!ta) return;
+  ta.value = scriptLoaded[activeScriptKind] ?? '';
+  for (const btn of document.querySelectorAll('#script-tabs button')) {
+    btn.classList.toggle('active', btn.dataset.kind === activeScriptKind);
+  }
+  renderSaveState();
+}
+
+function switchScript(kind) {
+  if (kind === activeScriptKind) return;
+  // stash current edits if dirty
+  const ta = document.getElementById('script-area');
+  if (ta && scriptDirty[activeScriptKind]) scriptLoaded[activeScriptKind] = ta.value;
+  activeScriptKind = kind;
+  showActiveScript();
+}
+
+function renderSaveState() {
+  const el = document.getElementById('script-state');
+  if (!el) return;
+  const dirty = scriptDirty[activeScriptKind];
+  el.textContent = dirty ? 'unsaved' : 'saved';
+  el.className = 'save-state ' + (dirty ? 'dirty' : 'saved');
+}
+
+async function saveScript() {
+  if (!current) return;
+  const ta = document.getElementById('script-area');
+  const content = ta.value;
+  const kind = activeScriptKind;
+  try {
+    await api(`/api/${current}/script/${kind}`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ content }),
+    });
+    scriptLoaded[kind] = content;
+    scriptDirty[kind] = false;
+    renderSaveState();
+  } catch (e) {
+    alert('save failed: ' + e.message);
+  }
+}
+
+async function reloadScript() {
+  if (scriptDirty[activeScriptKind] && !confirm('Discard unsaved changes?')) return;
+  try {
+    const data = await api(`/api/${current}/script/${activeScriptKind}`);
+    scriptLoaded[activeScriptKind] = data.content || '';
+    scriptDirty[activeScriptKind] = false;
+    showActiveScript();
+  } catch (e) { alert('reload failed: ' + e.message); }
+}
+
+async function act(action) {
+  if (!current) return;
+  await api(`/api/${current}/${action}`, {method:'POST'});
+  setTimeout(refreshDetail, 500);
+}
+
+async function del() {
   const name = current;
   if (!name) return;
-  const [appsList, metrics, history, logs] = await Promise.all([
-    api('/api/apps'),
-    api(`/api/${name}/metrics`),
-    api(`/api/${name}/history`),
-    api(`/api/${name}/logs?n=200`),
-  ]);
-  const a = appsList.find(x=>x.name===name);
-  const sched = (a.schedules||[]).map(s=>`<span class="pill">${s.spec}</span>`).join('') || '<small>none</small>';
-  const hookUrl = a.webhook_enabled ? `${location.origin}${a.webhook_path}?action=update` : '<small>disabled</small>';
-
-  document.getElementById('detail').className = '';
-  document.getElementById('detail').innerHTML = `
-    <h2 style="margin:0 0 4px">${name} <small style="color:${a.active?'#10b981':'#9ca3af'}">${a.active?'running':'stopped'}</small></h2>
-    <small>${a.description||''} · shell: ${a.shell}</small>
-    <div class="row" style="margin-top:12px">
-      <button onclick="act('${name}','start')">Start</button>
-      <button onclick="act('${name}','stop')">Stop</button>
-      <button onclick="act('${name}','restart')">Restart</button>
-      <button onclick="act('${name}','update')">Update now</button>
-      <button class="danger" onclick="del('${name}')">Delete</button>
-    </div>
-    <div class="card" style="margin-bottom:16px">
-      <div><b>Uptime</b></div>
-      ${renderUptime(metrics, history)}
-    </div>
-    <div class="grid2">
-      <div class="card"><b>CPU %</b><canvas id="cpu" height="120"></canvas></div>
-      <div class="card"><b>RAM</b><canvas id="ram" height="120"></canvas></div>
-    </div>
-    <div class="card" style="margin-top:16px">
-      <div><b>Schedules</b> ${sched}</div>
-      <div style="margin-top:8px"><b>Webhook</b> <code>${hookUrl}</code></div>
-    </div>
-    <div class="card" style="margin-top:16px">
-      <div><b>Logs</b> <small>(last 200 lines)</small></div>
-      <pre>${logs.replace(/[<&]/g, c=>({'<':'&lt;','&':'&amp;'}[c]))}</pre>
-    </div>
-    <div class="card" style="margin-top:16px">
-      <b>History</b>
-      <table>${history.slice().reverse().slice(0,40).map(h=>`<tr><td><small>${new Date(h.t*1000).toLocaleString()}</small></td><td>${h.event}</td><td><small>${h.detail||''}</small></td></tr>`).join('')}</table>
-    </div>
-  `;
-  buildChart(document.getElementById('cpu'), 'cpu%', metrics, '#60a5fa', p=>p.cpu);
-  buildChart(document.getElementById('ram'), 'rss',  metrics, '#f59e0b', p=>p.rss/1024/1024);
-}
-
-async function act(name, action) {
-  await api(`/api/${name}/${action}`, {method:'POST'});
-  setTimeout(renderDetail, 500);
-}
-
-async function del(name) {
   const typed = prompt(`Permanently delete "${name}"?\n\nThis stops the service, removes its systemd units, scripts, metrics, and history.\n\nType the app name to confirm:`);
   if (typed !== name) return;
   await api(`/api/${name}/delete`, {method:'POST'});
   current = null;
+  destroyCharts();
   document.getElementById('detail').className = 'empty';
-  document.getElementById('detail').innerHTML = `Deleted "${name}".`;
+  document.getElementById('detail').innerHTML = `Deleted "${escapeHtml(name)}".`;
   loadApps();
 }
 
 async function openSettings() {
-  const cfg = await api('/api/config');
-  alert('Most settings live in the TUI: sudo lazysystem → "g" settings.\n\n'
-      + `Web port: ${cfg.webhook_port}\nBind: ${cfg.web_bind}\nUser: ${cfg.web_user}\n`
-      + `Save logs: ${cfg.save_logs}\nMetrics interval: ${cfg.metrics_interval_seconds}s`);
+  let cfg;
+  try { cfg = await api('/api/config'); }
+  catch (e) { alert('failed to load config: ' + e.message); return; }
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = `
+    <div class="modal" onclick="event.stopPropagation()">
+      <h3>Settings</h3>
+      <div class="field"><label>Web port</label><input id="cfg-port" type="number" value="${cfg.webhook_port}"></div>
+      <div class="field"><label>Bind address</label><input id="cfg-bind" value="${escapeHtml(cfg.web_bind)}"></div>
+      <div class="field"><label>Web username</label><input id="cfg-user" value="${escapeHtml(cfg.web_user)}"></div>
+      <div class="field"><label>Default shell (auto / bash / fish)</label><input id="cfg-shell" value="${escapeHtml(cfg.shell)}"></div>
+      <div class="field"><label>Metrics interval (seconds)</label><input id="cfg-interval" type="number" value="${cfg.metrics_interval_seconds}"></div>
+      <div class="field"><label>Retention (days)</label><input id="cfg-ret" type="number" value="${cfg.retention_days ?? 3}"></div>
+      <div class="field"><label>Log max bytes</label><input id="cfg-logbytes" type="number" value="${cfg.log_max_bytes ?? 10485760}"></div>
+      <div class="field"><label><input id="cfg-savelogs" type="checkbox" ${cfg.save_logs ? 'checked' : ''}> save logs to file</label></div>
+      <small>Password and per-app fields stay in the TUI.</small>
+      <div class="row" style="justify-content:flex-end;margin-top:14px">
+        <button onclick="closeModal()">Cancel</button>
+        <button class="primary" onclick="saveSettings()">Save</button>
+      </div>
+    </div>
+  `;
+  bg.onclick = closeModal;
+  document.body.appendChild(bg);
+}
+
+function closeModal() {
+  document.querySelectorAll('.modal-bg').forEach(e => e.remove());
+}
+
+async function saveSettings() {
+  const body = {
+    webhook_port: parseInt(document.getElementById('cfg-port').value, 10),
+    web_bind: document.getElementById('cfg-bind').value.trim(),
+    web_user: document.getElementById('cfg-user').value.trim(),
+    shell: document.getElementById('cfg-shell').value.trim() || 'auto',
+    metrics_interval_seconds: Math.max(1, parseInt(document.getElementById('cfg-interval').value, 10) || 5),
+    retention_days: Math.max(0, parseInt(document.getElementById('cfg-ret').value, 10) || 3),
+    log_max_bytes: Math.max(0, parseInt(document.getElementById('cfg-logbytes').value, 10) || 0),
+    save_logs: document.getElementById('cfg-savelogs').checked,
+  };
+  try {
+    await api('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    closeModal();
+    refreshAuthState();
+  } catch (e) {
+    alert('save failed: ' + e.message);
+  }
 }
 
 async function refreshAuthState() {
@@ -196,7 +497,13 @@ async function refreshAuthState() {
   } catch (e) {}
 }
 
-loadApps(); refreshAuthState();
-setInterval(()=>{ loadApps(); if (current) renderDetail(); }, 5000);
+function poll() {
+  loadApps();
+  if (current) refreshDetail();
+}
+
+loadApps();
+refreshAuthState();
+pollTimer = setInterval(poll, 5000);
 </script>
 </body></html>

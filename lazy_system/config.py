@@ -8,6 +8,8 @@ DEFAULTS = {
     "shell": "auto",
     "metrics_interval_seconds": 5,
     "metrics_retention_points": 4320,
+    "retention_days": 3,
+    "log_max_bytes": 10 * 1024 * 1024,
     "web_user": "admin",
     "web_password": None,
     "web_bind": "0.0.0.0",

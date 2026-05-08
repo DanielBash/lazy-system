@@ -616,7 +616,6 @@ class LazyApp(App):
                     yield Button("+ New",     id="b-new",      variant="primary")
                     yield Button("Filter",    id="b-filter")
                     yield Button("Settings",  id="b-settings")
-                    yield Button("?",         id="b-help")
                 yield ListView(id="applist")
             self.detail = Detail()
             yield self.detail
@@ -684,7 +683,7 @@ class LazyApp(App):
             "b-webhook": self.action_webhook, "b-logs-full": self.action_logs_full,
             "b-delete": self.action_delete,
             "b-new": self.action_new, "b-settings": self.action_settings,
-            "b-filter": self.action_filter, "b-help": self.action_help,
+            "b-filter": self.action_filter,
         }
         fn = actions.get(bid)
         if fn: fn()

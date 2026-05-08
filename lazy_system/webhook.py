@@ -8,13 +8,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import apps, auth, config, history
-from .paths import metrics_path, log_path
+from .paths import metrics_path, log_path, app_script, app_dir
 import base64
 
 DASHBOARD_HTML = (Path(__file__).parent / "dashboard.html").read_text()
 
 
-def _read_metrics(name: str, limit: int = 720) -> list[dict]:
+def _read_metrics(name: str, limit: int = 60000) -> list[dict]:
     p = metrics_path(name)
     if not p.exists():
         return []
@@ -26,6 +26,24 @@ def _read_metrics(name: str, limit: int = 720) -> list[dict]:
         except Exception:
             pass
     return out
+
+
+SCRIPT_KINDS = ("run", "stop", "update")
+
+
+def _read_script(name: str, kind: str) -> dict:
+    p = app_script(name, kind)
+    text = p.read_text() if p.exists() else ""
+    return {"kind": kind, "path": str(p), "content": text}
+
+
+def _write_script(name: str, kind: str, content: str) -> None:
+    cfg = apps.load(name)
+    ext = "fish" if cfg.get("shell") == "fish" else "sh"
+    target = app_dir(name) / f"{kind}.{ext}"
+    target.write_text(content)
+    target.chmod(0o755)
+    history.record(name, "script_edited", detail=kind)
 
 
 def _read_logs(name: str, lines: int = 200) -> str:
@@ -125,6 +143,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(404, {"error": "no such app"})
             return self._send_json(200, history.read(name))
 
+        if len(parts) == 3 and parts[0] == "api" and parts[2] == "scripts":
+            name = parts[1]
+            if not apps.exists(name):
+                return self._send_json(404, {"error": "no such app"})
+            return self._send_json(200, {k: _read_script(name, k) for k in SCRIPT_KINDS})
+
+        if len(parts) == 4 and parts[0] == "api" and parts[2] == "script":
+            name, kind = parts[1], parts[3]
+            if not apps.exists(name):
+                return self._send_json(404, {"error": "no such app"})
+            if kind not in SCRIPT_KINDS:
+                return self._send_json(400, {"error": "unknown script kind"})
+            return self._send_json(200, _read_script(name, kind))
+
         if len(parts) == 3 and parts[0] == "api" and parts[2] == "logs":
             name = parts[1]
             if not apps.exists(name):
@@ -162,6 +194,27 @@ class Handler(BaseHTTPRequestHandler):
             config.save(cfg)
             apps.regenerate_all_units()
             return self._send_json(200, cfg)
+
+        # write script: POST /api/<app>/script/<kind>  body: {"content": "..."}
+        if len(parts) == 4 and parts[0] == "api" and parts[2] == "script":
+            name, kind = parts[1], parts[3]
+            if not apps.exists(name):
+                return self._send_json(404, {"error": "no such app"})
+            if kind not in SCRIPT_KINDS:
+                return self._send_json(400, {"error": "unknown script kind"})
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                return self._send_json(400, {"error": "invalid json"})
+            content = body.get("content", "")
+            if not isinstance(content, str):
+                return self._send_json(400, {"error": "content must be string"})
+            try:
+                _write_script(name, kind, content)
+            except OSError as e:
+                return self._send_json(500, {"error": str(e)})
+            return self._send_json(200, {"ok": True})
 
         # admin actions: /api/<app>/{start,stop,restart,update}
         if len(parts) == 3 and parts[0] == "api":
